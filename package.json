@@ -1,0 +1,32 @@
+{
+  "name": "radar-ponte",
+  "version": "1.0.0",
+  "description": "Ponte somente-leitura entre o WhatsApp de uma pessoa e o Supabase do app Radar.",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json && node dist/index.js",
+    "verificar-envio": "! grep -rnE \"sendMessage|sendPresenceUpdate|relayMessage|sendReceipt|readMessages|sendNode|chatModify|updateProfile|groupCreate|sendMessageAck|sendRetryRequest|presenceSubscribe\" src"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@supabase/supabase-js": "2.117.3",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "pino": "10.4.0",
+    "qrcode": "1.5.4",
+    "ws": "8.22.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "@types/qrcode": "1.5.6",
+    "@types/ws": "8.18.2",
+    "typescript": "7.0.2"
+  }
+}

@@ -1,1 +1,70 @@
-# radar
+# radar-ponte
+
+Serviço Node.js + TypeScript que funciona como **ponte somente-leitura** entre o WhatsApp de uma única pessoa e o banco Supabase do app Radar. Ele lê as conversas (histórico e tempo real) e grava em `conversas` e `mensagens`. **Ele nunca envia mensagens**, presença, confirmações de leitura nem nada para o WhatsApp.
+
+> **Aviso:** a conexão usa o WhatsApp Web via [Baileys](https://github.com/WhiskeySockets/Baileys), que **não é oficial**. O uso pode violar os termos do WhatsApp e **pode causar bloqueio do número**. Use por sua conta e risco.
+
+## Garantias de privacidade
+
+- Nenhuma função de envio é chamada (verificável com `npm run verificar-envio`).
+- Logs contêm apenas contagens, status e códigos de erro — nunca texto, nomes ou telefones.
+- Mídia nunca é baixada; grava-se apenas `tem_midia = true`.
+- A `SUPABASE_SERVICE_ROLE_KEY` só existe em variável de ambiente.
+
+## Variáveis de ambiente
+
+| Variável | Obrigatória | Padrão | Descrição |
+|---|---|---|---|
+| `SUPABASE_URL` | sim | — | URL do projeto Supabase |
+| `SUPABASE_SERVICE_ROLE_KEY` | sim | — | Chave service role (secreta) |
+| `OWNER_ID` | sim | — | uuid do usuário no Supabase Auth; todas as linhas levam esse `owner_id` |
+| `DATA_DIR` | não | `/data` | Pasta da sessão do WhatsApp (`DATA_DIR/auth`) |
+| `LOG_LEVEL` | não | `info` | `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent` |
+| `PORT` | não | `3000` | Porta do healthcheck |
+
+Se alguma variável obrigatória faltar ou for inválida, o processo sai com código 1 e uma mensagem listando o problema (sem mostrar valores). Veja `.env.example`.
+
+## Como funciona
+
+1. **Consentimento:** só conecta se `conexao.consentimento_aceito_em` estiver preenchido; senão mantém `status = 'aguardando_consentimento'` e verifica de novo a cada 15 s.
+2. **QR:** cada QR novo vira data URL PNG em `conexao.qr_code` (`status = 'aguardando_qr'`). Ao conectar: `status = 'conectado'`, `qr_code = null`.
+3. **Reconexão:** quedas comuns reconectam com backoff exponencial (2 s a 60 s, com jitter). Em logout, a sessão é apagada, `status = 'sessao_encerrada'` e o serviço aguarda um comando `novo_qr`.
+4. **Sincronização:** histórico completo (`messaging-history.set`) e tempo real (`messages.upsert`) em lotes de 200, com upsert idempotente. A tabela `sincronizacao` é atualizada a cada lote; `concluida = true` após 60 s sem novos lotes de histórico.
+5. **Filtros:** quando `configuracoes.ignorar_grupos = true`, mensagens de grupos (`@g.us`) são **simplesmente puladas** (nada é gravado) — opção mais simples. Telefones em `contatos_ignorados` (recarregados a cada 60 s), broadcasts, status e newsletters também são pulados.
+6. **Comandos:** tabela `comandos` via Realtime + polling a cada 10 s, um por vez:
+   - `novo_qr`: se já conectado, marca `erro`; senão reinicia a conexão para gerar novo QR.
+   - `reconectar`: fecha e reabre o socket mantendo a sessão.
+   - `desconectar`: logout, apaga a sessão, `status = 'desconectado'`, `qr_code = null`.
+7. **Healthcheck:** `GET /health` → `200 { "status": "ok", "conexao": "<status>" }`. Não há outros endpoints.
+8. **SIGTERM:** conclui o lote em andamento, fecha o socket sem logout e grava `status = 'reiniciando'`.
+
+## Desenvolvimento local
+
+```bash
+npm ci
+cp .env.example .env   # preencha os valores
+npm run build
+set -a; . ./.env; set +a
+DATA_DIR=./data npm start
+```
+
+## Deploy no Railway
+
+1. Crie um projeto no Railway e um serviço a partir deste repositório (o `railway.json` já define o builder Dockerfile e `restartPolicyType = ON_FAILURE`).
+2. Em **Settings → Volumes**, crie um volume montado em **`/data`** (guarda a sessão do WhatsApp entre deploys).
+3. Mantenha **exatamente 1 réplica**. Duas instâncias com a mesma sessão derrubam uma à outra.
+4. Em **Variables**, defina `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` e `OWNER_ID` (opcionalmente `LOG_LEVEL`). Não defina `PORT` manualmente se quiser usar a do Railway.
+5. Faça o deploy e acompanhe em **Deployments → View logs**. Deve aparecer o healthcheck ouvindo e o status da conexão.
+6. No app Radar, aceite o consentimento. O serviço gera o QR e grava em `conexao.qr_code`.
+7. No celular: **WhatsApp → Aparelhos conectados → Conectar um aparelho** e escaneie o QR exibido no app.
+8. Acompanhe o progresso em `sincronizacao` até `concluida = true`.
+
+> A imagem roda como usuário `node` (não root). Se os logs indicarem falta de permissão de escrita em `/data/auth`, o volume foi montado como root: ajuste a permissão do volume no Railway e reinicie.
+
+## Como testar
+
+- `npm run build` — compila sem erros.
+- `npm run verificar-envio` — falha se houver qualquer chamada de envio em `src/`.
+- `curl localhost:3000/health` — deve devolver `200` com o status da conexão.
+- Sem variáveis obrigatórias, `npm start` deve sair com código 1 e listar o que falta.
+- Fluxo completo: aceitar consentimento → QR em `conexao` → escanear → `status = 'conectado'` → linhas em `conversas`/`mensagens` → inserir em `comandos` (`reconectar`, `desconectar`, `novo_qr`) e conferir o `status` do comando.
