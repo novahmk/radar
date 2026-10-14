@@ -38,6 +38,37 @@ Se alguma variável obrigatória faltar ou for inválida, o processo sai com có
 7. **Healthcheck:** `GET /health` → `200 { "status": "ok", "conexao": "<status>" }`. Não há outros endpoints.
 8. **SIGTERM:** conclui o lote em andamento, fecha o socket sem logout e grava `status = 'reiniciando'`.
 
+## Extração gradual (fila de conversas)
+
+A ponte separa **captura** de **processamento**:
+
+1. **Captura:** ao parear o QR, o histórico e as mensagens em tempo real são gravados em `conversas` e `mensagens` (como descrito acima).
+2. **Fila:** toda conversa individual (não grupo) e não ignorada entra em `fila_conversas` como `pendente`. Conversas já existentes são enfileiradas na inicialização.
+3. **Lotes:** com a captura ociosa (sem histórico chegando), a ponte pega `tamanho_lote` conversas pendentes, da `ultima_mensagem_em` mais recente para a mais antiga, marca `em_processamento`, recalcula `total_mensagens`, `ultima_mensagem_em` e `ultima_mensagem_autor` a partir do banco e marca `processada` com `lote_numero` e `processada_em`. O próximo lote só começa depois de `intervalo_entre_lotes_min`.
+4. **Pausa e retomada:** com `extracao_pausada = true` nenhum lote novo começa. Ao reiniciar, conversas em `em_processamento` voltam para `pendente`.
+5. **Falhas:** erro numa conversa não trava o lote; `tentativas` é incrementado e, na 3ª falha, o status vira `erro`.
+6. **Progresso:** `sincronizacao` recebe `conversas_total_fila`, `conversas_processadas`, `lote_atual` e `proximo_lote_em`.
+
+> "Garantir que as mensagens estão gravadas" significa esperar a captura terminar antes de processar. A ponte **não** pede histórico adicional ao celular, porque isso exigiria enviar uma solicitação ao WhatsApp.
+
+### Schema necessário
+
+A tabela `fila_conversas` está em [supabase/migrations/20261014000000_fila_conversas.sql](supabase/migrations/20261014000000_fila_conversas.sql) (aplique pelo Lovable ou pelo SQL Editor; a ponte não executa DDL). Ela assume `conversas.id` do tipo `uuid` e precisa da chave estrangeira `conversa_id → conversas.id`, usada para ordenar a fila.
+
+As colunas abaixo são **criadas pelo Lovable**; a ponte apenas lê e escreve nelas:
+
+| Tabela | Coluna | Tipo sugerido | Uso |
+|---|---|---|---|
+| `configuracoes` | `tamanho_lote` | `integer default 5` | conversas por lote (1 a 50) |
+| `configuracoes` | `intervalo_entre_lotes_min` | `integer default 10` | minutos entre lotes |
+| `configuracoes` | `extracao_pausada` | `boolean default false` | pausa novos lotes |
+| `sincronizacao` | `conversas_total_fila` | `integer` | total na fila |
+| `sincronizacao` | `conversas_processadas` | `integer` | total `processada` |
+| `sincronizacao` | `lote_atual` | `integer` | número do último lote iniciado |
+| `sincronizacao` | `proximo_lote_em` | `timestamptz` | horário previsto do próximo lote (`null` se pausada ou ociosa) |
+
+Se as colunas de `configuracoes` ainda não existirem, os padrões (5 conversas, 10 min, não pausada) são usados.
+
 ## Desenvolvimento local
 
 ```bash

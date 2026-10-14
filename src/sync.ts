@@ -80,6 +80,7 @@ class Sincronizador {
   private mensagensRecebidas = 0;
   private timerHistorico?: NodeJS.Timeout;
   private historicoEmAndamento = false;
+  private aoGravarConversas?: (conversaIds: string[]) => Promise<void>;
 
   /** Carrega o contador acumulado para continuar somando após reinícios. */
   async iniciar(): Promise<void> {
@@ -91,6 +92,16 @@ class Sincronizador {
 
   definirResolvedor(fn: ResolvedorChat): void {
     this.resolvedor = fn;
+  }
+
+  /** Chamado com as conversas individuais gravadas em cada lote (usado pela fila). */
+  definirAoGravarConversas(fn: (conversaIds: string[]) => Promise<void>): void {
+    this.aoGravarConversas = fn;
+  }
+
+  /** true quando não há mensagens na memória nem histórico chegando. */
+  capturaOciosa(): boolean {
+    return this.fila.length === 0 && !this.processando && !this.historicoEmAndamento;
   }
 
   /** Guarda nomes vindos de contatos/chats; nunca sobrescreve com vazio. */
@@ -244,6 +255,20 @@ class Sincronizador {
         supabase.from('mensagens').upsert(linhas, { onConflict: 'owner_id,id_externo' }),
       );
       await this.recalcularConversas([...new Set(linhas.map((l) => l.conversa_id))]);
+
+      const individuais = new Set<string>();
+      for (const r of registros) {
+        const id = idsConversas.get(r.chat.jid);
+        if (id && !r.chat.ehGrupo) individuais.add(id);
+      }
+      if (this.aoGravarConversas && individuais.size > 0) {
+        try {
+          await this.aoGravarConversas([...individuais]);
+        } catch (erro) {
+          // A conversa entra na fila no próximo reinício (backfill).
+          logger.error(resumoErro(erro), 'Falha ao enfileirar conversas');
+        }
+      }
     }
 
     this.mensagensRecebidas += lote.length;
@@ -287,7 +312,7 @@ class Sincronizador {
   }
 
   /** Recalcula total e última mensagem a partir do banco, o que mantém os números consistentes mesmo com regravações. */
-  private async recalcularConversas(conversaIds: string[]): Promise<void> {
+  async recalcularConversas(conversaIds: string[]): Promise<void> {
     await emParalelo(conversaIds, CONCORRENCIA_RECALCULO, async (id) => {
       const [ultima, total] = await Promise.all([
         comRetry('ultima_mensagem', () =>

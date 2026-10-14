@@ -5,6 +5,7 @@ import { filtros } from './filtros.js';
 import { sincronizador } from './sync.js';
 import { sessaoSalvaExiste, whatsapp } from './whatsapp.js';
 import { comandos } from './comandos.js';
+import { filaConversas } from './fila.js';
 import { iniciarHealth } from './health.js';
 
 process.env.TZ ??= 'America/Sao_Paulo';
@@ -55,6 +56,13 @@ async function main(): Promise<void> {
   logger.info('Consentimento confirmado');
 
   comandos.iniciar();
+  sincronizador.definirAoGravarConversas((ids) => filaConversas.enfileirar(ids));
+  try {
+    await filaConversas.iniciar();
+  } catch (erro) {
+    // Sem a fila a captura continua; o processamento volta no próximo reinício.
+    logger.error(resumoErro(erro), 'Falha ao iniciar a fila de conversas');
+  }
 
   // Após logout/desconexão a sessão foi apagada: só gera QR quando o app pedir (comando novo_qr).
   if (!(await sessaoSalvaExiste()) && (statusAnterior === 'sessao_encerrada' || statusAnterior === 'desconectado')) {
@@ -73,6 +81,7 @@ async function encerrar(sinal: string): Promise<void> {
   try {
     await comandos.parar();
     filtros.parar();
+    await filaConversas.parar(LIMITE_LOTE_NO_ENCERRAMENTO_MS);
     await sincronizador.encerrar(LIMITE_LOTE_NO_ENCERRAMENTO_MS);
     await whatsapp.encerrarParaReinicio();
   } catch (erro) {
