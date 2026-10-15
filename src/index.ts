@@ -1,6 +1,6 @@
 import { config, VARIAVEIS_OBSOLETAS } from './config.js';
 import { logger, resumoErro } from './logger.js';
-import { atualizarConexao, iniciarHeartbeat, lerEstado, pararHeartbeat, type Estado } from './ponte.js';
+import { atualizarConexao, iniciarHeartbeat, lerEstado, pararHeartbeat, repetirComBackoff, type Estado } from './ponte.js';
 import { filtros } from './filtros.js';
 import { identidades } from './identidades.js';
 import { sincronizador } from './sync.js';
@@ -128,7 +128,9 @@ async function main(): Promise<void> {
   }
   iniciarHeartbeat();
   await identidades.carregar();
-  await sincronizador.iniciar();
+  // Sem o contador atual não dá para continuar (0 zeraria mensagens_recebidas): repete até conseguir.
+  const contadorLido = await repetirComBackoff('ler contador de mensagens', () => sincronizador.iniciar(), () => encerrando);
+  if (!contadorLido) return;
   await filtros.iniciar();
 
   const statusAnterior = await aguardarConsentimento();
