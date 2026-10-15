@@ -140,6 +140,8 @@ Requer `npm run build` antes (usa `dist/check.js`). No container do Railway: `no
 
 ## Deploy no Railway
 
+Passo a passo detalhado, com as variáveis exatas e o que esperar nos logs: **[DEPLOY-RAILWAY.md](DEPLOY-RAILWAY.md)**.
+
 1. Crie um projeto no Railway e um serviço a partir deste repositório (o `railway.json` já define o builder Dockerfile e `restartPolicyType = ON_FAILURE`).
 2. Em **Settings → Volumes**, crie um volume montado em **`/data`** (guarda a sessão do WhatsApp entre deploys).
 3. Mantenha **exatamente 1 réplica**. Duas instâncias com a mesma sessão derrubam uma à outra.
