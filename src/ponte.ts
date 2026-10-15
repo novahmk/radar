@@ -51,15 +51,19 @@ export async function chamarUmaVez<T>(acao: string, dados: unknown, timeoutMs = 
   }
 
   let corpo: { ok?: unknown; dados?: unknown; erro?: unknown } | undefined;
+  let jsonInvalido = false;
   try {
     corpo = (await resp.json()) as typeof corpo;
   } catch {
+    // Corpo vazio ou não-JSON: só o código resposta_invalida segue adiante, nunca o corpo.
     corpo = undefined;
+    jsonInvalido = true;
   }
   if (resp.ok && corpo?.ok === true) return (corpo.dados ?? {}) as T;
 
   const repetivel = resp.status >= 500 || resp.status === 408 || resp.status === 429 || (resp.ok && !corpo);
-  throw new ErroPonteApi(acao, resp.status, codigoSeguro(corpo?.erro), repetivel);
+  const codigo = jsonInvalido ? 'resposta_invalida' : codigoSeguro(corpo?.erro);
+  throw new ErroPonteApi(acao, resp.status, codigo, repetivel);
 }
 
 /**
