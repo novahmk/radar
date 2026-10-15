@@ -157,7 +157,8 @@ export async function atualizarConexao(campos: CamposConexao): Promise<void> {
 
 /** Estado lido do banco pela ponte-api (só o que a ponte precisa). */
 export interface Estado {
-  conexao: { status: string | null; consentido: boolean };
+  /** `existe` = false quando a ponte-api devolve `conexao: null` (linha do dono ainda não criada). */
+  conexao: { existe: boolean; status: string | null; consentido: boolean };
   configuracoes: Record<string, unknown>;
   contatosIgnorados: string[];
   mensagensRecebidas: number;
@@ -175,6 +176,7 @@ export async function lerEstado(): Promise<Estado> {
   const recebidas = Number(d.sincronizacao?.mensagens_recebidas ?? 0);
   return {
     conexao: {
+      existe: d.conexao != null && typeof d.conexao === 'object',
       status: typeof d.conexao?.status === 'string' ? d.conexao.status : null,
       consentido: Boolean(d.conexao?.consentimento_aceito_em),
     },

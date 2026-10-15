@@ -1,6 +1,6 @@
 import { config, VARIAVEIS_OBSOLETAS } from './config.js';
 import { logger, resumoErro } from './logger.js';
-import { atualizarConexao, iniciarHeartbeat, lerEstado, pararHeartbeat } from './ponte.js';
+import { atualizarConexao, iniciarHeartbeat, lerEstado, pararHeartbeat, type Estado } from './ponte.js';
 import { filtros } from './filtros.js';
 import { identidades } from './identidades.js';
 import { sincronizador } from './sync.js';
@@ -28,23 +28,50 @@ process.on('unhandledRejection', (erro) => {
 
 const servidor = iniciarHealth(config.PORT, () => whatsapp.status);
 
+const esperar = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+let ultimaLeituraConsentimento: string | undefined;
+
+/** Loga cada leitura: em info quando consentimento/existência da linha mudam, em debug nas repetições. */
+function registrarLeituraConsentimento(conexao: Estado['conexao']): void {
+  const campos = { consentido: conexao.consentido, status: conexao.status, linhaConexaoExiste: conexao.existe };
+  const chave = `${conexao.existe}|${conexao.consentido}`;
+  if (chave === ultimaLeituraConsentimento) {
+    logger.debug(campos, 'Consentimento lido');
+    return;
+  }
+  ultimaLeituraConsentimento = chave;
+  logger.info(campos, 'Consentimento lido');
+  if (!conexao.existe) {
+    logger.warn('A ponte-api devolveu conexao = null: a linha de conexão do dono não existe; consentimento tratado como não aceito');
+  }
+}
+
 async function aguardarConsentimento(): Promise<string | null> {
   let avisado = false;
   for (;;) {
     if (encerrando) return null;
+    let conexao: Estado['conexao'] | undefined;
     try {
-      const { consentido, status } = (await lerEstado()).conexao;
-      if (consentido) return status;
+      conexao = (await lerEstado()).conexao;
+    } catch (erro) {
+      logger.error(resumoErro(erro), 'Falha ao ler consentimento');
+    }
+    if (conexao) {
+      registrarLeituraConsentimento(conexao);
+      if (conexao.consentido) return conexao.status;
       if (!avisado) {
         whatsapp.definirStatusLocal('aguardando_consentimento');
-        await atualizarConexao({ status: 'aguardando_consentimento' });
-        logger.info('Consentimento ainda não aceito no app; verificando a cada 15 s');
-        avisado = true;
+        try {
+          await atualizarConexao({ status: 'aguardando_consentimento' });
+          logger.info('Consentimento ainda não aceito no app; verificando a cada 15 s');
+          avisado = true;
+        } catch (erro) {
+          logger.error({ status: 'aguardando_consentimento', ...resumoErro(erro) }, 'Falha ao gravar status da conexão');
+        }
       }
-    } catch (erro) {
-      logger.error(resumoErro(erro), 'Falha ao verificar consentimento');
     }
-    await new Promise((r) => setTimeout(r, INTERVALO_CONSENTIMENTO_MS));
+    await esperar(INTERVALO_CONSENTIMENTO_MS);
   }
 }
 
@@ -66,18 +93,27 @@ function vigiarConsentimento(): void {
     verificando = true;
     void (async () => {
       try {
-        const { consentido, status } = (await lerEstado()).conexao;
-        if (!consentido && !whatsapp.suspensaPorConsentimento) {
-          logger.warn('Consentimento revogado no app; desconectando sem apagar sessão nem dados');
-          await whatsapp.suspenderPorConsentimento();
-        } else if (consentido && whatsapp.suspensaPorConsentimento) {
-          logger.info('Consentimento aceito de novo; retomando a conexão');
-          whatsapp.liberarConsentimento();
-          await conectarConformeEstado(status);
+        let conexao: Estado['conexao'];
+        try {
+          conexao = (await lerEstado()).conexao;
+        } catch (erro) {
+          // Falha de leitura não é revogação: mantém o estado atual.
+          logger.error(resumoErro(erro), 'Falha ao reverificar consentimento');
+          return;
         }
-      } catch (erro) {
-        // Falha de leitura não é revogação: mantém o estado atual.
-        logger.error(resumoErro(erro), 'Falha ao reverificar consentimento');
+        registrarLeituraConsentimento(conexao);
+        try {
+          if (!conexao.consentido && !whatsapp.suspensaPorConsentimento) {
+            logger.warn('Consentimento revogado no app; desconectando sem apagar sessão nem dados');
+            await whatsapp.suspenderPorConsentimento();
+          } else if (conexao.consentido && whatsapp.suspensaPorConsentimento) {
+            logger.info('Consentimento aceito de novo; retomando a conexão');
+            whatsapp.liberarConsentimento();
+            await conectarConformeEstado(conexao.status);
+          }
+        } catch (erro) {
+          logger.error(resumoErro(erro), 'Falha ao aplicar a mudança de consentimento');
+        }
       } finally {
         verificando = false;
       }
