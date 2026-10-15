@@ -54,10 +54,15 @@ async function prepararPastaAuth(): Promise<string> {
 }
 
 export async function sessaoSalvaExiste(): Promise<boolean> {
-  return access(path.join(PASTA_AUTH, 'creds.json')).then(
-    () => true,
-    () => false,
-  );
+  try {
+    await access(path.join(PASTA_AUTH, 'creds.json'));
+    return true;
+  } catch (erro) {
+    if ((erro as { code?: unknown }).code !== 'ENOENT') {
+      logger.warn(resumoErro(erro), 'Não foi possível verificar a sessão salva; tratando como inexistente');
+    }
+    return false;
+  }
 }
 
 async function apagarSessao(): Promise<void> {
@@ -103,13 +108,16 @@ class ConexaoWhatsApp {
     this.statusAtual = status;
   }
 
-  private async definirStatus(status: StatusConexao, extras: Parameters<typeof atualizarConexao>[0] = {}): Promise<void> {
+  /** Grava o status na ponte-api. Retorna true só se a gravação foi confirmada. */
+  private async definirStatus(status: StatusConexao, extras: Parameters<typeof atualizarConexao>[0] = {}): Promise<boolean> {
     this.statusAtual = status;
     logger.info({ status }, 'Status da conexão');
     try {
       await atualizarConexao({ status, ...extras });
+      return true;
     } catch (erro) {
-      logger.error(resumoErro(erro), 'Falha ao gravar status da conexão');
+      logger.error({ status, ...resumoErro(erro) }, 'Falha ao gravar status da conexão');
+      return false;
     }
   }
 
@@ -131,9 +139,19 @@ class ConexaoWhatsApp {
     }
     await this.definirStatus('conectando');
 
+    const sessaoSalva = await sessaoSalvaExiste();
     const { state, saveCreds } = await useMultiFileAuthState(pasta);
-    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
+    // fetchLatestBaileysVersion nunca rejeita: em falha devolve a versão embutida com isLatest=false e error.
+    const { version, isLatest, error } = await fetchLatestBaileysVersion();
+    const versaoWa = version.join('.');
+    if (!isLatest || error) {
+      logger.warn(
+        { versaoWa, ...(error ? resumoErro(error) : {}) },
+        'Não foi possível obter a versão mais recente do WhatsApp Web; usando a versão embutida no Baileys',
+      );
+    }
     if (geracao !== this.geracao || this.encerrando || this.suspensa) return;
+    logger.info({ sessaoSalva, versaoWa, versaoMaisRecente: isLatest }, 'Sessão do WhatsApp iniciando');
 
     const sock = makeWASocket({
       version,
@@ -153,7 +171,10 @@ class ConexaoWhatsApp {
     sock.ev.on('creds.update', () => void saveCreds().catch((e) => logger.error(resumoErro(e), 'Falha ao salvar credenciais')));
 
     sock.ev.on('connection.update', (u) => {
-      if (atual()) void this.aoAtualizarConexao(u, geracao);
+      if (!atual()) return;
+      this.aoAtualizarConexao(u, geracao).catch((erro) =>
+        logger.error(resumoErro(erro), 'Falha ao tratar atualização da conexão'),
+      );
     });
 
     sock.ev.on('lid-mapping.update', ({ lid, pn }) => identidades.registrarPar(lid, pn));
@@ -193,7 +214,10 @@ class ConexaoWhatsApp {
       try {
         const dataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 320 });
         if (geracao !== this.geracao) return;
-        await this.definirStatus('aguardando_qr', { qr_code: dataUrl, qr_atualizado_em: new Date().toISOString() });
+        logger.info({ geracao }, 'QR gerado');
+        const enviado = await this.definirStatus('aguardando_qr', { qr_code: dataUrl, qr_atualizado_em: new Date().toISOString() });
+        if (enviado) logger.info({ geracao }, 'QR enviado');
+        else logger.error({ geracao, status: 'aguardando_qr' }, 'Falha ao enviar QR');
       } catch (erro) {
         logger.error(resumoErro(erro), 'Falha ao gerar QR');
       }
@@ -208,7 +232,8 @@ class ConexaoWhatsApp {
     if (connection === 'close') {
       this.sock = undefined;
       const codigo = (lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
-      logger.warn({ codigo: codigo ?? null }, 'Conexão com o WhatsApp encerrada');
+      const motivo = codigo === undefined ? null : (DisconnectReason[codigo] ?? 'desconhecido');
+      logger.warn({ codigo: codigo ?? null, motivo }, 'Conexão com o WhatsApp encerrada');
       if (this.encerrando) return;
 
       if (codigo === DisconnectReason.loggedOut) {
