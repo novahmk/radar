@@ -22,7 +22,7 @@ import {
 import QRCode from 'qrcode';
 import { config } from './config.js';
 import { identidades } from './identidades.js';
-import { logger, loggerBaileys, resumoErro } from './logger.js';
+import { ErroSeguro, logger, loggerBaileys, resumoErro } from './logger.js';
 import { atualizarConexao, type StatusConexao } from './ponte.js';
 import { sincronizador, type ChatResolvido } from './sync.js';
 
@@ -43,8 +43,11 @@ async function prepararPastaAuth(): Promise<string> {
     await mkdir(PASTA_AUTH, { recursive: true, mode: 0o700 });
     await access(PASTA_AUTH, constants.R_OK | constants.W_OK);
   } catch (erro) {
-    throw new Error(
-      `Sem permissão de escrita em ${PASTA_AUTH}. Verifique o volume montado em DATA_DIR (${resumoErro(erro).codigo ?? 'erro'}).`,
+    const codigo = resumoErro(erro).codigo;
+    throw new ErroSeguro(
+      `Sem permissão de escrita em ${PASTA_AUTH}. Verifique o volume montado em DATA_DIR (${codigo ?? 'erro'}).`,
+      'ErroPastaAuth',
+      typeof codigo === 'string' ? codigo : undefined,
     );
   }
   return PASTA_AUTH;
@@ -118,9 +121,16 @@ class ConexaoWhatsApp {
     if (this.encerrando || this.suspensa) return;
     this.cancelarReconexao();
     const geracao = ++this.geracao;
+
+    let pasta: string;
+    try {
+      pasta = await prepararPastaAuth();
+    } catch (erro) {
+      await this.definirStatus('erro');
+      throw erro;
+    }
     await this.definirStatus('conectando');
 
-    const pasta = await prepararPastaAuth();
     const { state, saveCreds } = await useMultiFileAuthState(pasta);
     const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
     if (geracao !== this.geracao || this.encerrando || this.suspensa) return;

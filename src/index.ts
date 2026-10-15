@@ -130,6 +130,6 @@ process.on('SIGTERM', () => void encerrar('SIGTERM'));
 process.on('SIGINT', () => void encerrar('SIGINT'));
 
 main().catch((erro) => {
-  logger.fatal({ ...resumoErro(erro), detalhe: erro instanceof Error && erro.message.startsWith('Sem permissão') ? erro.message : undefined }, 'Falha na inicialização');
+  logger.fatal(resumoErro(erro), 'Falha na inicialização');
   process.exit(1);
 });

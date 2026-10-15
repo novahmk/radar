@@ -25,14 +25,27 @@ export const logger = pino({
 /** Logger silencioso entregue ao Baileys, cujos logs internos podem conter jids e conteúdo. */
 export const loggerBaileys = pino({ level: 'silent' });
 
-/** Resume um erro sem expor conteúdo: apenas tipo e código. */
-export function resumoErro(erro: unknown): { tipo: string; codigo?: string | number } {
+/** Erro cuja mensagem é escrita pela ponte e não contém dados pessoais: pode ir para o log como `detalhe`. */
+export class ErroSeguro extends Error {
+  constructor(
+    mensagem: string,
+    nome = 'ErroSeguro',
+    public readonly code?: string,
+  ) {
+    super(mensagem);
+    this.name = nome;
+  }
+}
+
+/** Resume um erro sem expor conteúdo: apenas tipo e código (e a mensagem, só para ErroSeguro). */
+export function resumoErro(erro: unknown): { tipo: string; codigo?: string | number; detalhe?: string } {
   if (erro && typeof erro === 'object') {
     const e = erro as { name?: unknown; code?: unknown; output?: { statusCode?: unknown }; status?: unknown };
     const codigo = e.code ?? e.output?.statusCode ?? e.status;
     return {
       tipo: typeof e.name === 'string' ? e.name : 'Erro',
       codigo: typeof codigo === 'string' || typeof codigo === 'number' ? codigo : undefined,
+      detalhe: erro instanceof ErroSeguro ? erro.message : undefined,
     };
   }
   return { tipo: typeof erro };
