@@ -41,6 +41,8 @@ Ele guarda, entre deploys:
 
 Os dois contêm identificadores e telefones: não exporte nem compartilhe o volume.
 
+> **Permissão do volume:** o Railway monta volumes como `root`, e a imagem roda como usuário `node`. Sem ajuste, a ponte não consegue gravar em `/data/auth`: o log mostra `Sem permissão de escrita em /data/auth`, o status vai para `erro` e o QR nunca é gerado. Defina **`RAILWAY_RUN_UID=0`** nas variáveis do serviço (solução indicada na [documentação de volumes do Railway](https://docs.railway.com/volumes/reference#caveats)). Com ela o container roda como root.
+
 ## 4. Variáveis (Settings → Variables)
 
 | Variável | Valor | Observação |
@@ -48,6 +50,7 @@ Os dois contêm identificadores e telefones: não exporte nem compartilhe o volu
 | `PONTE_API_URL` | `https://holo-match-engine.lovable.app/api/public/ponte-api` | exato; precisa ser `https` |
 | `PONTE_TOKEN` | *(segredo; mínimo 32 caracteres)* | o mesmo valor configurado como segredo na `ponte-api`. Cole direto no Railway. |
 | `DATA_DIR` | `/data` | opcional: já é o padrão no Dockerfile. Precisa ser o caminho do volume. |
+| `RAILWAY_RUN_UID` | `0` | necessário para gravar no volume (montado como root); veja a seção 3 |
 | `LOG_LEVEL` | `info` | opcional |
 | `PORT` | *(não defina)* | o Railway injeta a porta; o healthcheck usa a mesma |
 
@@ -63,16 +66,18 @@ Logs em JSON, horário de São Paulo, só com contagens, status e códigos. Nunc
 |---|---|---|
 | 1 | `Iniciando radar-ponte (somente leitura)` | processo subiu |
 | 2 | `Healthcheck ouvindo` (`porta`) | `/health` respondendo; o deploy fica saudável |
-| 3 | `Consentimento ainda não aceito no app; verificando a cada 15 s` | normal até aceitar no app (`status = aguardando_consentimento`) |
-| 4 | `Consentimento confirmado` | aceite lido pela `ponte-api` |
-| 5 | `Fila de conversas sincronizada com as conversas existentes` (`enfileiradas`) | `fila_iniciar` ok |
-| 6 | `Status da conexão` `conectando` → `aguardando_qr` | QR gravado em `conexao.qr_code`; escaneie pelo app (**WhatsApp → Aparelhos conectados → Conectar um aparelho**) |
-| 7 | `Conexão com o WhatsApp encerrada` (`codigo: 515`) | **normal** logo após escanear (reinício pedido pelo WhatsApp) |
-| 8 | `Status da conexão` `conectando` → `conectado` | pareado |
-| 9 | `Lote de histórico recebido` / `Lote processado` (`recebidas`, `gravadas`, `lotesPendentes`) | histórico chegando e sendo gravado |
-| 10 | `Fila de conversas aguardando` (`aguardando_captura`) | a extração espera a captura terminar |
-| 11 | `Sincronização do histórico concluída (60 s sem novos lotes)` | `sincronizacao.concluida = true` |
-| 12 | `Lote de conversas processado` (`lote`, `processadas`, `falhas`) | extração gradual em andamento |
+| 3 | `Consentimento lido` (`consentido`, `status`, `linhaConexaoExiste`) | leitura do aceite na `ponte-api` (info quando muda; repetições só em `debug`) |
+| 4 | `Consentimento ainda não aceito no app; verificando a cada 15 s` | normal até aceitar no app (`status = aguardando_consentimento`) |
+| 5 | `Consentimento confirmado` | aceite lido pela `ponte-api` |
+| 6 | `Fila de conversas sincronizada com as conversas existentes` (`enfileiradas`) | `fila_iniciar` ok |
+| 7 | `Status da conexão` `conectando` → `Sessão do WhatsApp iniciando` (`sessaoSalva`, `versaoWa`, `versaoMaisRecente`) | pasta `DATA_DIR/auth` validada; socket sendo aberto |
+| 8 | `QR gerado` → `Status da conexão` `aguardando_qr` → `QR enviado` | QR gravado em `conexao.qr_code` (só aparece `QR enviado` se a gravação foi confirmada); escaneie pelo app (**WhatsApp → Aparelhos conectados → Conectar um aparelho**) |
+| 9 | `Conexão com o WhatsApp encerrada` (`codigo: 515`, `motivo: restartRequired`) | **normal** logo após escanear (reinício pedido pelo WhatsApp) |
+| 10 | `Status da conexão` `conectando` → `conectado` | pareado |
+| 11 | `Lote de histórico recebido` / `Lote processado` (`recebidas`, `gravadas`, `lotesPendentes`) | histórico chegando e sendo gravado |
+| 12 | `Fila de conversas aguardando` (`aguardando_captura`) | a extração espera a captura terminar |
+| 13 | `Sincronização do histórico concluída (60 s sem novos lotes)` | `sincronizacao.concluida = true` |
+| 14 | `Lote de conversas processado` (`lote`, `processadas`, `falhas`) | extração gradual em andamento |
 
 O heartbeat (`conexao.ultimo_evento_em` a cada 60 s) não gera log.
 
@@ -80,12 +85,19 @@ O heartbeat (`conexao.ultimo_evento_em` a cada 60 s) não gera log.
 
 | Log | Causa provável |
 |---|---|
-| `Falha ao verificar consentimento` (ou outro `Falha ao...`) com `codigo: nao_autorizado` | `PONTE_TOKEN` diferente do segredo da função |
-| `Falha ao verificar consentimento` (ou outro `Falha ao...`) com `codigo: 404` ou `enotfound` | `PONTE_API_URL` errada |
+| `Falha ao ler consentimento` (ou outro `Falha ao...`) com `codigo: nao_autorizado` | `PONTE_TOKEN` diferente do segredo da função |
+| `Falha ao ler consentimento` (ou outro `Falha ao...`) com `codigo: 404` ou `enotfound` | `PONTE_API_URL` errada |
+| `codigo: resposta_invalida` | a `ponte-api` respondeu com corpo vazio ou que não é JSON (URL apontando para outra coisa, ou erro da função) |
+| `A ponte-api devolveu conexao = null` | não existe linha em `conexao` para o dono; a ponte trata como sem consentimento e cria a linha ao gravar `aguardando_consentimento` |
+| `Falha persistente; tentando de novo com backoff` (`operacao: ler contador de mensagens`) | `ponte-api` fora na subida; a ponte fica tentando (2 s a 60 s) em vez de encerrar |
 | `ponte-api falhou; tentando de novo` com `codigo: erro_interno`, `timeout` ou `econnrefused` | `ponte-api` instável ou fora; a ponte repete sozinha |
 | `Falha ao enviar lote; mantido em memória para nova tentativa` | `ponte-api` fora; nada se perde enquanto o serviço estiver de pé (até 50.000 mensagens) |
 | `Fila em memória cheia; mensagens novas descartadas...` | `ponte-api` fora por muito tempo |
-| `Falha na inicialização` com `Sem permissão de escrita em /data/auth` | volume montado como root: ajuste a permissão do volume e reinicie |
+| `detalhe: Sem permissão de escrita em /data/auth` (em `Falha na inicialização`, `Falha ao iniciar a conexão`, `Comando falhou` etc.) e `status = erro` | volume montado como root: defina `RAILWAY_RUN_UID=0` (seção 3) e reinicie |
+| `Não foi possível verificar a sessão salva; tratando como inexistente` | `DATA_DIR/auth/creds.json` sem permissão de leitura: mesma causa acima |
+| `Não foi possível obter a versão mais recente do WhatsApp Web` | sem acesso ao GitHub; usa a versão embutida no Baileys. Se em seguida a conexão cair sem QR, essa versão pode estar desatualizada |
+| `Falha ao enviar QR` | o QR foi gerado mas a `ponte-api` não confirmou; o próximo QR chega em cerca de 20 s |
+| `Conexão com o WhatsApp encerrada` repetido com `motivo` `badSession`, `forbidden`, `multideviceMismatch` ou `desconhecido` | sessão salva inválida: o serviço só reconecta e não gera QR. Peça `desconectar` e depois `novo_qr` pelo app |
 | `Sem sessão salva; aguardando comando novo_qr` | sessão anterior encerrada; peça um novo QR pelo app |
 | `Consentimento revogado no app; desconectando sem apagar sessão nem dados` | aceite removido no app |
 

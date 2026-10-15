@@ -20,6 +20,7 @@ Serviço Node.js + TypeScript que funciona como **ponte somente-leitura** entre 
 | `PONTE_API_URL` | sim | — | URL da Edge Function, ex.: `https://SEU-PROJETO.supabase.co/functions/v1/ponte-api` |
 | `PONTE_TOKEN` | sim | — | Segredo compartilhado com a função (mínimo 32 caracteres; gere com `openssl rand -hex 32`) |
 | `DATA_DIR` | não | `/data` | Pasta da sessão do WhatsApp (`DATA_DIR/auth`) e de `identidades.json` |
+| `RAILWAY_RUN_UID` | no Railway, sim | — | `0`. O Railway monta o volume como root e a imagem roda como `node`; sem isso, a ponte não grava em `/data/auth` e o QR não é gerado |
 | `LOG_LEVEL` | não | `info` | `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent` |
 | `PORT` | não | `3000` | Porta do healthcheck |
 
@@ -146,13 +147,13 @@ Passo a passo detalhado, com as variáveis exatas e o que esperar nos logs: **[D
 2. Em **Settings → Volumes**, crie um volume montado em **`/data`** (guarda a sessão do WhatsApp entre deploys).
 3. Mantenha **exatamente 1 réplica**. Duas instâncias com a mesma sessão derrubam uma à outra.
 4. Publique a Edge Function `ponte-api` (veja [CONTRATO-PONTE-API.md](CONTRATO-PONTE-API.md)) com os segredos `PONTE_TOKEN` e `PONTE_OWNER_ID`. Teste antes com `npm run check` apontando para ela.
-5. Em **Variables**, defina `PONTE_API_URL` e `PONTE_TOKEN` (opcionalmente `LOG_LEVEL`). Remova `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` e `OWNER_ID` se existirem. Não defina `PORT` manualmente se quiser usar a do Railway.
+5. Em **Variables**, defina `PONTE_API_URL`, `PONTE_TOKEN` e `RAILWAY_RUN_UID=0` (opcionalmente `LOG_LEVEL`). Remova `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` e `OWNER_ID` se existirem. Não defina `PORT` manualmente se quiser usar a do Railway.
 6. Faça o deploy e acompanhe em **Deployments → View logs**. Deve aparecer o healthcheck ouvindo e o status da conexão.
 7. No app Radar, aceite o consentimento. O serviço gera o QR e grava em `conexao.qr_code`.
 8. No celular: **WhatsApp → Aparelhos conectados → Conectar um aparelho** e escaneie o QR exibido no app.
 9. Acompanhe o progresso em `sincronizacao` até `concluida = true`.
 
-> A imagem roda como usuário `node` (não root). Se os logs indicarem falta de permissão de escrita em `/data/auth`, o volume foi montado como root: ajuste a permissão do volume no Railway e reinicie.
+> A imagem roda como usuário `node` (não root), mas o Railway monta volumes como root ([documentação](https://docs.railway.com/volumes/reference#caveats)). Por isso é preciso `RAILWAY_RUN_UID=0`, que faz o container rodar como root. Sem ela, o log mostra `detalhe: Sem permissão de escrita em /data/auth`, o status vai para `erro` e nenhum QR é gerado.
 
 ## Como testar
 
