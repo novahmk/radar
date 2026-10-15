@@ -157,7 +157,9 @@ class ConexaoWhatsApp {
       version,
       auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, loggerBaileys) },
       logger: loggerBaileys,
-      browser: Browsers.macOS('Desktop'),
+      // Não use 'Desktop' com Mac OS/Windows: com syncFullHistory o Baileys se apresenta como app de
+      // desktop e o WhatsApp encerra a conexão (428) antes de enviar o QR.
+      browser: Browsers.macOS('Chrome'),
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
       markOnlineOnConnect: false,

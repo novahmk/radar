@@ -81,6 +81,8 @@ Logs em JSON, horário de São Paulo, só com contagens, status e códigos. Nunc
 
 O heartbeat (`conexao.ultimo_evento_em` a cada 60 s) não gera log.
 
+> **Histórico:** a ponte se identifica como navegador web (Chrome no Mac OS) e continua pedindo o histórico completo (`syncFullHistory`). Mesmo assim, como cliente web, o WhatsApp pode enviar menos histórico antigo do que enviaria para um app de desktop. O modo desktop foi abandonado porque o WhatsApp encerra a conexão (428) antes do QR.
+
 ### Sinais de problema
 
 | Log | Causa provável |
@@ -98,6 +100,7 @@ O heartbeat (`conexao.ultimo_evento_em` a cada 60 s) não gera log.
 | `Não foi possível obter a versão mais recente do WhatsApp Web` | sem acesso ao GitHub; usa a versão embutida no Baileys. Se em seguida a conexão cair sem QR, essa versão pode estar desatualizada |
 | `Falha ao enviar QR` | o QR foi gerado mas a `ponte-api` não confirmou; o próximo QR chega em cerca de 20 s |
 | `Conexão com o WhatsApp encerrada` repetido com `motivo` `badSession`, `forbidden`, `multideviceMismatch` ou `desconhecido` | sessão salva inválida: o serviço só reconecta e não gera QR. Peça `desconectar` e depois `novo_qr` pelo app |
+| `Sessão do WhatsApp iniciando` seguido de `Conexão com o WhatsApp encerrada` (`codigo: 428`, `motivo: connectionClosed`) sem `QR gerado` | o WhatsApp recusou a identificação do cliente. A ponte usa `Browsers.macOS('Chrome')`; com `Desktop` em Mac OS/Windows (modo app de desktop, pedido junto com `syncFullHistory`) o WhatsApp encerra antes do QR. Não volte para `Desktop` |
 | `Sem sessão salva; aguardando comando novo_qr` | sessão anterior encerrada; peça um novo QR pelo app |
 | `Consentimento revogado no app; desconectando sem apagar sessão nem dados` | aceite removido no app |
 
