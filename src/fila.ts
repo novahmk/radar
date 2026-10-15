@@ -1,5 +1,5 @@
 import { logger, resumoErro } from './logger.js';
-import { chamar, lerEstado } from './ponte.js';
+import { chamar, lerEstado, repetirComBackoff } from './ponte.js';
 import { sincronizador } from './sync.js';
 
 const TAMANHO_LOTE_PADRAO = 5;
@@ -36,15 +36,29 @@ class FilaConversas {
   private loteNumero = 0;
   private ultimoEstado?: 'pausada' | 'ociosa' | 'aguardando_captura';
 
+  /** Não bloqueia: a preparação (com retentativas) e o ciclo de lotes rodam em segundo plano. */
+  iniciar(): void {
+    this.loop = this.preparar().then((ok) => (ok ? this.executar() : undefined));
+  }
+
   /**
    * No servidor: conversas que ficaram 'em_processamento' quando o serviço caiu voltam para 'pendente'
    * e conversas capturadas antes da fila existir (ou de uma falha) são enfileiradas.
+   * Se falhar, tenta de novo com backoff (2 s a 60 s) em vez de esperar o próximo reinício.
    */
-  async iniciar(): Promise<void> {
-    const { ultimo_lote, enfileiradas } = await chamar<{ ultimo_lote?: unknown; enfileiradas?: unknown }>('fila_iniciar');
-    this.loteNumero = inteiroOu(ultimo_lote, 0, 0, Number.MAX_SAFE_INTEGER);
-    logger.info({ enfileiradas: inteiroOu(enfileiradas, 0, 0, Number.MAX_SAFE_INTEGER) }, 'Fila de conversas sincronizada com as conversas existentes');
-    this.loop = this.executar();
+  private preparar(): Promise<boolean> {
+    return repetirComBackoff(
+      'fila_iniciar',
+      async () => {
+        const r = await chamar<{ ultimo_lote?: unknown; enfileiradas?: unknown }>('fila_iniciar');
+        this.loteNumero = inteiroOu(r.ultimo_lote, 0, 0, Number.MAX_SAFE_INTEGER);
+        logger.info(
+          { enfileiradas: inteiroOu(r.enfileiradas, 0, 0, Number.MAX_SAFE_INTEGER) },
+          'Fila de conversas sincronizada com as conversas existentes',
+        );
+      },
+      () => this.parando,
+    );
   }
 
   /** Espera o lote em andamento terminar (com limite de tempo). */
@@ -150,12 +164,11 @@ class FilaConversas {
     const tentativas = item.tentativas + 1;
     const status = tentativas >= MAX_TENTATIVAS ? 'erro' : 'pendente';
     logger.warn({ tentativas, status, ...resumoErro(erro) }, 'Falha ao processar conversa da fila');
-    try {
-      await chamar('fila_falha', { fila_id: item.filaId, tentativas, status });
-    } catch (e) {
-      // Se nem isso gravar, a conversa volta a 'pendente' no próximo reinício.
-      logger.error(resumoErro(e), 'Falha ao registrar erro da conversa na fila');
-    }
+    // Tenta de novo com backoff para o item não ficar preso em 'em_processamento'. Se o serviço parar
+    // antes (ou a função recusar os dados), o item volta a 'pendente' no próximo fila_iniciar.
+    await repetirComBackoff('fila_falha', () => chamar('fila_falha', { fila_id: item.filaId, tentativas, status }), () => this.parando, {
+      desistirSePermanente: true,
+    });
   }
 
   private async atualizarProgresso(proximoLoteEm: string | null): Promise<void> {

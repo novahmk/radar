@@ -12,6 +12,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsc -p tsconfig.json && node dist/index.js",
+    "check": "node dist/check.js",
     "verificar-envio": "! grep -rnE \"sendMessage|sendPresenceUpdate|relayMessage|sendReceipt|readMessages|sendNode|chatModify|updateProfile|groupCreate|sendMessageAck|sendRetryRequest|presenceSubscribe|fetchMessageHistory|sendPeerDataOperation\" src"
   },
   "license": "UNLICENSED",

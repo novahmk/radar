@@ -32,7 +32,8 @@ function erroDeRede(acao: string, erro: unknown): ErroPonteApi {
   return new ErroPonteApi(acao, undefined, codigo, true);
 }
 
-async function chamarUmaVez<T>(acao: string, dados: unknown): Promise<T> {
+/** Uma única tentativa, sem retry (usada pelo `npm run check`). */
+export async function chamarUmaVez<T>(acao: string, dados: unknown, timeoutMs = TIMEOUT_MS): Promise<T> {
   let resp: Response;
   try {
     resp = await fetch(config.PONTE_API_URL, {
@@ -43,7 +44,7 @@ async function chamarUmaVez<T>(acao: string, dados: unknown): Promise<T> {
         accept: 'application/json',
       },
       body: JSON.stringify({ acao, dados }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (erro) {
     throw erroDeRede(acao, erro);
@@ -80,6 +81,51 @@ export async function chamar<T = Record<string, never>>(acao: string, dados: obj
     }
   }
   throw ultimoErro;
+}
+
+/** Erros em que repetir a mesma requisição não adianta: a função recusou os dados. */
+export function erroPermanente(erro: unknown): boolean {
+  return erro instanceof ErroPonteApi && (erro.status === 400 || erro.status === 413 || erro.status === 422);
+}
+
+/** Backoff exponencial com jitter de ±25%: 2 s, 4 s, 8 s... até 60 s. */
+export function backoffComJitter(tentativa: number, inicialMs = 2_000, maximoMs = 60_000): number {
+  const base = Math.min(maximoMs, inicialMs * 2 ** Math.max(0, tentativa - 1));
+  return Math.min(maximoMs, Math.round(base * (0.75 + Math.random() * 0.5)));
+}
+
+/** Espera `ms`, mas volta antes se `parar()` ficar true (verifica a cada 500 ms). */
+export async function esperarOuParar(ms: number, parar: () => boolean): Promise<void> {
+  const fim = Date.now() + ms;
+  while (!parar() && Date.now() < fim) await esperar(Math.min(500, fim - Date.now()));
+}
+
+/**
+ * Repete `fn` com backoff crescente (2 s a 60 s) até dar certo ou `parar()` ficar true.
+ * Com `desistirSePermanente`, desiste quando a função recusa os dados (400/413/422).
+ * Retorna true se deu certo.
+ */
+export async function repetirComBackoff(
+  operacao: string,
+  fn: () => Promise<unknown>,
+  parar: () => boolean,
+  { desistirSePermanente = false } = {},
+): Promise<boolean> {
+  for (let tentativa = 1; !parar(); tentativa++) {
+    try {
+      await fn();
+      return true;
+    } catch (erro) {
+      if (desistirSePermanente && erroPermanente(erro)) {
+        logger.error({ operacao, ...resumoErro(erro) }, 'ponte-api recusou os dados; desistindo');
+        return false;
+      }
+      const esperaMs = backoffComJitter(tentativa);
+      logger.warn({ operacao, tentativa, esperaMs, ...resumoErro(erro) }, 'Falha persistente; tentando de novo com backoff');
+      await esperarOuParar(esperaMs, parar);
+    }
+  }
+  return false;
 }
 
 export type StatusConexao =

@@ -10,7 +10,8 @@ Serviço Node.js + TypeScript que funciona como **ponte somente-leitura** entre 
 - Logs contêm apenas contagens, status e códigos de erro — nunca texto, nomes ou telefones.
 - Mídia nunca é baixada; grava-se apenas `tem_midia = true`.
 - A ponte não tem a `SUPABASE_SERVICE_ROLE_KEY`: ela fica só nos segredos da Edge Function. A ponte guarda apenas o `PONTE_TOKEN`, em variável de ambiente, enviado só no header `Authorization` (nunca logado). Fora de `localhost` a URL precisa ser `https`.
-- Corpos de resposta da `ponte-api` nunca vão para os logs; só a ação, o status HTTP e um código curto de erro.
+- Corpos de resposta da `ponte-api` nunca vão para os logs; só a ação, o status HTTP e um código curto de erro. A fila de envio em memória também só loga contagens.
+- `DATA_DIR` guarda a sessão do WhatsApp (`auth/`) e o mapa de identidades das conversas (`identidades.json`, permissão `600`, com jids e telefones). Os dois têm a mesma sensibilidade e ficam só no volume.
 
 ## Variáveis de ambiente
 
@@ -18,7 +19,7 @@ Serviço Node.js + TypeScript que funciona como **ponte somente-leitura** entre 
 |---|---|---|---|
 | `PONTE_API_URL` | sim | — | URL da Edge Function, ex.: `https://SEU-PROJETO.supabase.co/functions/v1/ponte-api` |
 | `PONTE_TOKEN` | sim | — | Segredo compartilhado com a função (mínimo 32 caracteres; gere com `openssl rand -hex 32`) |
-| `DATA_DIR` | não | `/data` | Pasta da sessão do WhatsApp (`DATA_DIR/auth`) |
+| `DATA_DIR` | não | `/data` | Pasta da sessão do WhatsApp (`DATA_DIR/auth`) e de `identidades.json` |
 | `LOG_LEVEL` | não | `info` | `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent` |
 | `PORT` | não | `3000` | Porta do healthcheck |
 
@@ -28,19 +29,38 @@ Se alguma variável obrigatória faltar ou for inválida, o processo sai com có
 
 ## Como funciona
 
-1. **Consentimento:** só conecta se `conexao.consentimento_aceito_em` estiver preenchido; senão mantém `status = 'aguardando_consentimento'` e verifica de novo a cada 15 s.
+1. **Consentimento:** só conecta se `conexao.consentimento_aceito_em` estiver preenchido; senão mantém `status = 'aguardando_consentimento'` e verifica de novo a cada 15 s. Depois de conectado, continua relendo a cada 15 s: se o consentimento for **revogado**, fecha a conexão **sem logout e sem apagar nada** (sessão local e dados no banco continuam), grava `status = 'aguardando_consentimento'` e recusa `novo_qr`/`reconectar` até ele voltar. Falha de leitura não conta como revogação.
 2. **QR:** cada QR novo vira data URL PNG em `conexao.qr_code` (`status = 'aguardando_qr'`). Ao conectar: `status = 'conectado'`, `qr_code = null`.
 3. **Reconexão:** quedas comuns reconectam com backoff exponencial (2 s a 60 s, com jitter). Em logout, a sessão é apagada, `status = 'sessao_encerrada'` e o serviço aguarda um comando `novo_qr`.
 4. **Sincronização:** histórico completo (`messaging-history.set`) e tempo real (`messages.upsert`) em lotes de 200, cada lote enviado numa única ação `lote` (idempotente). A tabela `sincronizacao` é atualizada a cada lote; `concluida = true` após 60 s sem novos lotes de histórico.
-5. **Filtros:** quando `configuracoes.ignorar_grupos = true`, mensagens de grupos (`@g.us`) são **simplesmente puladas** (nada é gravado) — opção mais simples. Telefones em `contatos_ignorados` (recarregados a cada 60 s), broadcasts, status e newsletters também são pulados.
+   - **Lote só sai da memória depois de confirmado.** Se a `ponte-api` falhar, o lote fica numa fila em memória e é reenviado com backoff crescente (2 s, 4 s, 8 s... até 60 s, com jitter) enquanto o serviço estiver vivo. Lotes pequenos que chegam durante a falha são juntados (até 200 mensagens).
+   - **Limite de memória:** no máximo 50.000 mensagens aguardando confirmação. Acima disso, mensagens **novas** são descartadas e o log mostra só a contagem (no máximo um aviso por minuto).
+   - **Recusa definitiva** (400/413/422): o mesmo lote recusado 3 vezes é descartado, para não travar os seguintes.
+   - Um reinício perde o que ainda não foi confirmado (a fila é só em memória); o log do encerramento mostra quantas mensagens ficaram.
+5. **Filtros:** quando `configuracoes.ignorar_grupos = true`, mensagens de grupos (`@g.us`) são **simplesmente puladas** (nada é gravado) — opção mais simples. Telefones em `contatos_ignorados` (recarregados a cada 60 s), broadcasts, status e newsletters também são pulados. Uma conversa `@lid` cujo telefone ainda é desconhecido não tem como ser comparada e é gravada; o filtro é reaplicado a cada mensagem e, **quando o telefone é resolvido** e está na lista, a conversa vai em `conversas_ignoradas` e a `ponte-api` marca `ignorada = true` (sai da fila de extração). As mensagens seguintes dela não são gravadas.
 6. **Comandos:** tabela `comandos` lida por **polling a cada 10 s** (`comandos_pendentes`), um por vez:
    - `novo_qr`: se já conectado, marca `erro`; senão reinicia a conexão para gerar novo QR.
    - `reconectar`: fecha e reabre o socket mantendo a sessão.
    - `desconectar`: logout, apaga a sessão, `status = 'desconectado'`, `qr_code = null`.
+   - Se gravar o status do comando falhar, ele **não é executado de novo**: o status fica em memória e é reenviado a cada ciclo até a `ponte-api` confirmar.
 7. **Heartbeat:** toda gravação em `conexao` carimba `ultimo_evento_em`. Além disso, a cada 60 s a ponte envia só `ultimo_evento_em`, sem mexer no `status`, para o app saber que ela está viva.
-8. **Retry:** cada chamada à `ponte-api` tem timeout de 30 s e até 3 tentativas com backoff exponencial e jitter (0,5 s e 1,5 s). Repetem-se só falhas de rede, timeout, 408, 429 e 5xx; outros 4xx falham na hora. Quedas do WhatsApp têm backoff próprio (item 3).
+8. **Retry:** cada chamada à `ponte-api` tem timeout de 30 s e até 3 tentativas com backoff exponencial e jitter (0,5 s e 1,5 s). Repetem-se só falhas de rede, timeout, 408, 429 e 5xx; outros 4xx falham na hora. Por cima disso, `lote`, `fila_iniciar`, `fila_falha` e `comando_status` são retentados por mais tempo (backoff de 2 s a 60 s ou a cada ciclo). Quedas do WhatsApp têm backoff próprio (item 3).
 9. **Healthcheck:** `GET /health` → `200 { "status": "ok", "conexao": "<status>" }`. Não há outros endpoints.
-10. **SIGTERM:** conclui o lote em andamento, fecha o socket sem logout e grava `status = 'reiniciando'`.
+10. **SIGTERM:** espera o envio em andamento (até 20 s), grava `identidades.json`, fecha o socket sem logout e grava `status = 'reiniciando'`.
+
+## Conversas `@lid` (chave estável)
+
+O WhatsApp identifica contatos por telefone (`...@s.whatsapp.net`) ou por um id opaco (`...@lid`), e o par entre os dois nem sempre é conhecido na hora. Antes, a mesma pessoa podia virar duas conversas: uma pelo `@lid` (sem telefone) e outra pelo telefone, quando o par aparecia.
+
+**Escolha: manter o jid original como chave e só preencher o telefone depois**, com unificação para o caso raro de duas chaves:
+
+1. Na primeira vez que a conversa aparece, a chave é o jid do telefone, se já conhecido (igual ao comportamento anterior, então dados já gravados continuam válidos), ou o `@lid`.
+2. A chave **nunca muda**. Quando o telefone de um `@lid` é descoberto, ele só é registrado como alias e enviado no campo `telefone` da mesma conversa. Mensagens que chegam depois pelo telefone caem na mesma chave `@lid`.
+3. Os pares vêm só do que o WhatsApp já entrega: `remoteJidAlt` da mensagem, eventos `lid-mapping.update`, `lidPnMappings` do histórico, contatos e o mapeamento salvo na sessão. A ponte **não** consulta o servidor para descobrir pares (isso seria enviar algo ao WhatsApp).
+4. Se a mesma pessoa já tinha ganhado duas chaves antes de o par ser conhecido, a ponte passa a usar uma só (a do telefone) e envia `unificar: [{ jid_de, jid_para }]` no próximo lote; a `ponte-api` junta as conversas e mensagens (veja o contrato). A unificação fica pendente em disco até ser confirmada.
+5. O mapa fica em `DATA_DIR/identidades.json`. Se o volume for apagado, a sessão também é, e o pareamento recomeça do zero.
+
+A alternativa (mandar o par `jid_lid`/`jid_telefone` em toda mensagem para a função resolver) foi descartada porque deixaria o `id_externo` dependente de uma decisão do servidor e exigiria unificação a cada lote.
 
 ## Extração gradual (fila de conversas)
 
@@ -49,8 +69,8 @@ A ponte separa **captura** de **processamento**:
 1. **Captura:** ao parear o QR, o histórico e as mensagens em tempo real são gravados em `conversas` e `mensagens` (como descrito acima).
 2. **Fila:** toda conversa individual (não grupo) e não ignorada entra em `fila_conversas` como `pendente`. Conversas já existentes são enfileiradas na inicialização.
 3. **Lotes:** com a captura ociosa (sem histórico chegando), a ponte reserva `tamanho_lote` conversas pendentes (`fila_proximos`), da `ultima_mensagem_em` mais recente para a mais antiga, já marcadas `em_processamento`, recalcula `total_mensagens`, `ultima_mensagem_em` e `ultima_mensagem_autor` a partir do banco e marca `processada` com `lote_numero` e `processada_em`. O próximo lote só começa depois de `intervalo_entre_lotes_min`.
-4. **Pausa e retomada:** com `extracao_pausada = true` nenhum lote novo começa. Ao reiniciar, conversas em `em_processamento` voltam para `pendente`.
-5. **Falhas:** erro numa conversa (em `fila_processada`) não trava o lote; `tentativas` é incrementado e, na 3ª falha, o status vira `erro`.
+4. **Pausa e retomada:** com `extracao_pausada = true` nenhum lote novo começa. Ao reiniciar, conversas em `em_processamento` voltam para `pendente` (`fila_iniciar`). Se `fila_iniciar` falhar, a ponte tenta de novo com backoff (2 s a 60 s) sem bloquear a captura, em vez de esperar o próximo reinício.
+5. **Falhas:** erro numa conversa (em `fila_processada`) não trava o lote; `tentativas` é incrementado e, na 3ª falha, o status vira `erro`. Se gravar a falha (`fila_falha`) também falhar, a ponte repete com backoff até conseguir, para o item não ficar preso em `em_processamento`.
 6. **Progresso:** `sincronizacao` recebe `conversas_total_fila`, `conversas_processadas`, `lote_atual` e `proximo_lote_em`.
 
 > "Garantir que as mensagens estão gravadas" significa esperar a captura terminar antes de processar. A ponte **não** pede histórico adicional ao celular, porque isso exigiria enviar uma solicitação ao WhatsApp.
@@ -75,47 +95,21 @@ Se as colunas de `configuracoes` ainda não existirem, os padrões (5 conversas,
 
 ## Contrato da Edge Function `ponte-api`
 
-A ponte só conversa com o Supabase por esta função. Ela deve ser implementada no projeto Supabase (por exemplo, pelo Lovable).
+A ponte só conversa com o Supabase por esta função, que deve ser implementada no projeto Supabase (por exemplo, pelo Lovable). O contrato completo, com cada ação, o payload, a resposta e os códigos de erro, está em **[CONTRATO-PONTE-API.md](CONTRATO-PONTE-API.md)**.
 
-### Requisição e resposta
+Resumo:
 
-```http
-POST {PONTE_API_URL}
-Authorization: Bearer {PONTE_TOKEN}
-Content-Type: application/json
+- `POST {PONTE_API_URL}` com `Authorization: Bearer {PONTE_TOKEN}` e corpo `{ "acao": "<nome>", "dados": { ... } }`. Sucesso: `200 { "ok": true, "dados": ... }`. Erro: não-2xx `{ "ok": false, "erro": "<codigo>" }`.
+- A função é publicada com `verify_jwt = false`, compara o token em tempo constante com o segredo `PONTE_TOKEN` e tira o `owner_id` do segredo `PONTE_OWNER_ID`. A service role fica só no Supabase.
+- Toda ação precisa ser idempotente (a ponte repete requisições).
 
-{ "acao": "<nome>", "dados": { ... } }
-```
-
-- **Sucesso:** HTTP `200` com `{ "ok": true, "dados": { ... } }`.
-- **Erro:** HTTP não-2xx com `{ "ok": false, "erro": "<codigo>" }`, onde `<codigo>` é curto, em `snake_case` e **sem conteúdo**: `nao_autorizado` (401), `acao_invalida` (400), `dados_invalidos` (422), `erro_interno` (500). A ponte só registra códigos nesse formato.
-- A ponte repete falhas de rede, timeout, 408, 429 e 5xx. Por isso, **toda ação precisa ser idempotente**.
-
-### Requisitos da função
-
-- **Autenticação:** publique com `verify_jwt = false` (em `supabase/config.toml`: `[functions.ponte-api]` `verify_jwt = false`), porque o token não é um JWT. Compare o `Bearer` com o segredo `PONTE_TOKEN` em tempo constante e responda `401` se não bater.
-- **Dono:** o `owner_id` vem do segredo `PONTE_OWNER_ID` da função (uuid do usuário no Supabase Auth), **nunca** da requisição. Toda leitura e escrita filtra por esse `owner_id`.
-- **Banco:** use `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY`, que já existem no ambiente das Edge Functions. A chave service role fica só no Supabase.
-- **Privacidade:** não registre `dados` nem conteúdo de mensagens nos logs da função.
-- **Segredos:** `supabase secrets set PONTE_TOKEN=... PONTE_OWNER_ID=...` (o mesmo `PONTE_TOKEN` da ponte).
-
-### Ações
-
-| Categoria | Ação | `dados` enviados | O que a função faz | `dados` da resposta |
-|---|---|---|---|---|
-| estado | `estado` | `{}` | Lê `conexao` (`status`, `consentimento_aceito_em`), `configuracoes` (`ignorar_grupos`, `tamanho_lote`, `intervalo_entre_lotes_min`, `extracao_pausada`; colunas ausentes podem ser omitidas), os `telefone` de `contatos_ignorados` e `sincronizacao.mensagens_recebidas`. | `{ conexao: {status, consentimento_aceito_em} \| null, configuracoes: {...} \| null, contatos_ignorados: string[], sincronizacao: {mensagens_recebidas} \| null }` |
-| conexão | `conexao` | qualquer subconjunto de `{ status, qr_code, qr_atualizado_em, conectado_em }` + sempre `ultimo_evento_em` | Upsert em `conexao` por `owner_id` **só com os campos enviados** (lista permitida acima; chave presente com `null` grava `null`). Só com `ultimo_evento_em` é o heartbeat. | `{}` |
-| estado | `historico` | `{ concluida: boolean }` | Upsert de `sincronizacao.concluida` por `owner_id`. | `{}` |
-| lotes | `lote` | `{ conversas: [{ jid, eh_grupo, telefone?, nome_contato? }], mensagens: [{ jid, id_externo, autor: 'eu'\|'contato', enviada_em, texto, tem_midia }], mensagens_recebidas: number }` | 1) Upsert em `conversas` por `(owner_id, jid)` com `origem = 'whatsapp'`; `telefone` e `nome_contato` só são gravados quando vierem (nunca apagar valor existente). 2) Upsert em `mensagens` por `(owner_id, id_externo)`, trocando `jid` pelo `conversa_id`. 3) Para cada conversa do lote, recalcula `total_mensagens`, `ultima_mensagem_em` e `ultima_mensagem_autor` a partir de `mensagens`. 4) Insere em `fila_conversas` (`status = 'pendente'`, `tentativas = 0`; `on conflict (conversa_id) do nothing`) as conversas do lote com `eh_grupo = false` e `ignorada` diferente de `true`. 5) Upsert em `sincronizacao` de `mensagens_recebidas` (valor absoluto enviado), `mensagens_gravadas` e `conversas_gravadas` (contagens do dono) e `ultimo_lote_em = now()`. Listas podem vir vazias (só contadores). | `{}` |
-| fila | `fila_iniciar` | `{}` | Volta `em_processamento` → `pendente` e enfileira (como em `lote`, item 4) todas as conversas individuais e não ignoradas que ainda não estão na fila. | `{ ultimo_lote: number, enfileiradas: number }` (`ultimo_lote` = maior `lote_numero`, ou 0) |
-| fila | `fila_proximos` | `{ limite: number }` (1 a 50) | Seleciona até `limite` itens `pendente` cuja conversa é individual e não ignorada, ordenados por `conversas.ultima_mensagem_em desc nulls last`, e os marca `em_processamento`. | `{ itens: [{ fila_id, conversa_id, tentativas }] }` |
-| fila | `fila_processada` | `{ fila_id, lote_numero }` | Recalcula a conversa do item (como em `lote`, item 3) e marca `status = 'processada'`, `processada_em = now()`, `lote_numero`. | `{}` |
-| fila | `fila_falha` | `{ fila_id, tentativas, status: 'pendente'\|'erro' }` | Grava `tentativas` e `status` (valores absolutos) no item. | `{}` |
-| fila | `fila_progresso` | `{ lote_atual, proximo_lote_em: string \| null }` | Upsert em `sincronizacao` de `lote_atual`, `proximo_lote_em`, `conversas_total_fila` (total da fila do dono) e `conversas_processadas` (itens `processada`). | `{}` |
-| comandos | `comandos_pendentes` | `{}` | Lista `comandos` com `status = 'pendente'`, por `criado_em` crescente. | `{ comandos: [{ id, tipo }] }` |
-| comandos | `comando_status` | `{ id, status: 'executado'\|'erro' }` | Atualiza o `status` do comando `id` (do dono). | `{}` |
-
-Correspondência com o acesso direto anterior: leituras de `conexao`/`configuracoes`/`contatos_ignorados`/`sincronizacao` → `estado`; upserts de `conexao` → `conexao`; `sincronizacao.concluida` → `historico`; upserts de `conversas` e `mensagens`, recálculo, enfileiramento e contadores → `lote`; retomada e preenchimento inicial da fila → `fila_iniciar`; seleção e marcação do lote → `fila_proximos`; recálculo e conclusão de cada conversa → `fila_processada`; falhas → `fila_falha`; progresso → `fila_progresso`; Realtime e polling de `comandos` → `comandos_pendentes` (polling de 10 s) e `comando_status`.
+| Categoria | Ações |
+|---|---|
+| estado | `estado`, `historico` |
+| conexão | `conexao` (status, QR e heartbeat) |
+| lotes | `lote` (conversas, mensagens, `conversas_ignoradas`, `unificar`, contadores) |
+| fila | `fila_iniciar`, `fila_proximos`, `fila_processada`, `fila_falha`, `fila_progresso` |
+| comandos | `comandos_pendentes`, `comando_status` |
 
 ## Desenvolvimento local
 
@@ -124,15 +118,32 @@ npm ci
 cp .env.example .env   # preencha os valores
 npm run build
 set -a; . ./.env; set +a
+npm run check          # testa as variáveis e a ponte-api
 DATA_DIR=./data npm start
 ```
+
+### `npm run check`
+
+Valida as variáveis e faz uma chamada de leitura (ação `estado`) à `ponte-api`, com uma única tentativa e timeout de 15 s. Imprime `OK` (código 0) ou `FALHA: <motivo>` (código 1). Nunca imprime o token nem dados retornados; mostra só o host.
+
+| Saída | Significado |
+|---|---|
+| `FALHA: variáveis inválidas` | lista o nome e o motivo de cada variável com problema |
+| `FALHA: 401: token errado` | `PONTE_TOKEN` não confere com o segredo da função |
+| `FALHA: 404: URL errada ou ação inexistente` | `PONTE_API_URL` errada ou função não publicada |
+| `FALHA: 400: ação inexistente na função` | a função não reconhece `estado` |
+| `FALHA: timeout: serviço fora` | sem resposta em 15 s |
+| `FALHA: econnrefused` / `enotfound` | serviço fora ou host inexistente |
+| `FALHA: 5xx: erro interno na função` | erro dentro da função |
+
+Requer `npm run build` antes (usa `dist/check.js`). No container do Railway: `node dist/check.js`.
 
 ## Deploy no Railway
 
 1. Crie um projeto no Railway e um serviço a partir deste repositório (o `railway.json` já define o builder Dockerfile e `restartPolicyType = ON_FAILURE`).
 2. Em **Settings → Volumes**, crie um volume montado em **`/data`** (guarda a sessão do WhatsApp entre deploys).
 3. Mantenha **exatamente 1 réplica**. Duas instâncias com a mesma sessão derrubam uma à outra.
-4. Publique a Edge Function `ponte-api` (veja o contrato acima) com os segredos `PONTE_TOKEN` e `PONTE_OWNER_ID`.
+4. Publique a Edge Function `ponte-api` (veja [CONTRATO-PONTE-API.md](CONTRATO-PONTE-API.md)) com os segredos `PONTE_TOKEN` e `PONTE_OWNER_ID`. Teste antes com `npm run check` apontando para ela.
 5. Em **Variables**, defina `PONTE_API_URL` e `PONTE_TOKEN` (opcionalmente `LOG_LEVEL`). Remova `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` e `OWNER_ID` se existirem. Não defina `PORT` manualmente se quiser usar a do Railway.
 6. Faça o deploy e acompanhe em **Deployments → View logs**. Deve aparecer o healthcheck ouvindo e o status da conexão.
 7. No app Radar, aceite o consentimento. O serviço gera o QR e grava em `conexao.qr_code`.
@@ -145,6 +156,7 @@ DATA_DIR=./data npm start
 
 - `npm run build` — compila sem erros.
 - `npm run verificar-envio` — falha se houver qualquer chamada de envio em `src/`.
+- `npm run check` — testa as variáveis e a conexão com a `ponte-api` (OK/FALHA com o motivo).
 - `curl localhost:3000/health` — deve devolver `200` com o status da conexão.
 - Sem variáveis obrigatórias (ou com `PONTE_API_URL` em `http` fora de localhost), `npm start` deve sair com código 1 e listar o problema.
 - Contra a função rodando localmente (`supabase functions serve ponte-api --no-verify-jwt`), use `PONTE_API_URL=http://127.0.0.1:54321/functions/v1/ponte-api`.

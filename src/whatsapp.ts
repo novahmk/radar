@@ -21,6 +21,7 @@ import {
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import { config } from './config.js';
+import { identidades } from './identidades.js';
 import { logger, loggerBaileys, resumoErro } from './logger.js';
 import { atualizarConexao, type StatusConexao } from './ponte.js';
 import { sincronizador, type ChatResolvido } from './sync.js';
@@ -66,6 +67,15 @@ function nomeDeContato(c: Partial<Contact>): { ids: (string | undefined)[]; nome
   return { ids, nome: c.notify || c.name || c.verifiedName };
 }
 
+/** Contatos trazem o par @lid ↔ telefone quando o WhatsApp o conhece. */
+function registrarParesDeContatos(contatos: Partial<Contact>[]): void {
+  for (const c of contatos) {
+    const lid = c.lid ?? (c.id && isLidUser(c.id) ? c.id : undefined);
+    const pn = c.phoneNumber ?? (c.id && isPnUser(c.id) ? c.id : undefined);
+    identidades.registrarPar(lid, pn);
+  }
+}
+
 /**
  * Conexão somente-leitura com o WhatsApp Web.
  * Este módulo apenas escuta eventos; não existe nenhum caminho de envio.
@@ -78,6 +88,8 @@ class ConexaoWhatsApp {
   private timerReconexao?: NodeJS.Timeout;
   private statusAtual: StatusConexao = 'desconectado';
   private encerrando = false;
+  /** true enquanto o consentimento estiver revogado no app: nenhuma conexão é aberta. */
+  private suspensa = false;
 
   get status(): StatusConexao {
     return this.statusAtual;
@@ -98,8 +110,12 @@ class ConexaoWhatsApp {
     }
   }
 
+  get suspensaPorConsentimento(): boolean {
+    return this.suspensa;
+  }
+
   async iniciar(): Promise<void> {
-    if (this.encerrando) return;
+    if (this.encerrando || this.suspensa) return;
     this.cancelarReconexao();
     const geracao = ++this.geracao;
     await this.definirStatus('conectando');
@@ -107,7 +123,7 @@ class ConexaoWhatsApp {
     const pasta = await prepararPastaAuth();
     const { state, saveCreds } = await useMultiFileAuthState(pasta);
     const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
-    if (geracao !== this.geracao || this.encerrando) return;
+    if (geracao !== this.geracao || this.encerrando || this.suspensa) return;
 
     const sock = makeWASocket({
       version,
@@ -130,8 +146,12 @@ class ConexaoWhatsApp {
       if (atual()) void this.aoAtualizarConexao(u, geracao);
     });
 
-    sock.ev.on('messaging-history.set', ({ messages, contacts, chats, syncType }) => {
+    sock.ev.on('lid-mapping.update', ({ lid, pn }) => identidades.registrarPar(lid, pn));
+
+    sock.ev.on('messaging-history.set', ({ messages, contacts, chats, syncType, lidPnMappings }) => {
       if (!atual()) return;
+      for (const par of lidPnMappings ?? []) identidades.registrarPar(par.lid, par.pn);
+      registrarParesDeContatos(contacts);
       sincronizador.registrarNomes(contacts.map(nomeDeContato));
       sincronizador.registrarNomes(chats.map((c) => ({ ids: [c.id ? jidNormalizedUser(c.id) : undefined], nome: c.name })));
       logger.info({ mensagens: messages.length, conversas: chats.length, tipo: syncType ?? null }, 'Lote de histórico recebido');
@@ -142,8 +162,14 @@ class ConexaoWhatsApp {
       if (atual()) sincronizador.enfileirar(messages, false);
     });
 
-    sock.ev.on('contacts.upsert', (cs) => sincronizador.registrarNomes(cs.map(nomeDeContato)));
-    sock.ev.on('contacts.update', (cs) => sincronizador.registrarNomes(cs.map(nomeDeContato)));
+    sock.ev.on('contacts.upsert', (cs) => {
+      registrarParesDeContatos(cs);
+      sincronizador.registrarNomes(cs.map(nomeDeContato));
+    });
+    sock.ev.on('contacts.update', (cs) => {
+      registrarParesDeContatos(cs);
+      sincronizador.registrarNomes(cs.map(nomeDeContato));
+    });
     sock.ev.on('chats.upsert', (chats) =>
       sincronizador.registrarNomes(chats.map((c) => ({ ids: [c.id ? jidNormalizedUser(c.id) : undefined], nome: c.name }))),
     );
@@ -202,7 +228,7 @@ class ConexaoWhatsApp {
   }
 
   private async agendarReconexao(): Promise<void> {
-    if (this.encerrando) return;
+    if (this.encerrando || this.suspensa) return;
     this.cancelarReconexao();
     const base = Math.min(BACKOFF_MAXIMO_MS, BACKOFF_INICIAL_MS * 2 ** this.tentativas);
     const atraso = Math.min(BACKOFF_MAXIMO_MS, Math.round(base * (0.75 + Math.random() * 0.5)));
@@ -232,33 +258,43 @@ class ConexaoWhatsApp {
     }
   }
 
-  /** Resolve o jid para a identidade canônica da conversa (prefere o telefone quando o jid é @lid). */
+  /**
+   * Resolve o jid para a chave estável da conversa (veja identidades.ts).
+   * Só usa dados locais: o par vindo na mensagem (remoteJidAlt) e o mapeamento já salvo na sessão.
+   */
   async resolverChat(jid: string, jidAlternativo?: string | null): Promise<ChatResolvido> {
     const base = { telefone: null, ehGrupo: false, descartar: false };
     if (isJidStatusBroadcast(jid) || isJidBroadcast(jid) || isJidNewsletter(jid)) {
-      return { ...base, jid, jidOriginal: jid, descartar: true };
+      return { ...base, jid, jidOriginal: jid, jidsConhecidos: [jid], descartar: true };
     }
     const original = jidNormalizedUser(jid);
-    if (isJidGroup(original)) return { ...base, jid: original, jidOriginal: original, ehGrupo: true };
+    if (isJidGroup(original)) return { ...base, jid: original, jidOriginal: original, jidsConhecidos: [original], ehGrupo: true };
+    if (!isPnUser(original) && !isLidUser(original)) return { ...base, jid: original, jidOriginal: original, jidsConhecidos: [original] };
 
-    let pn: string | undefined;
-    if (isPnUser(original)) {
-      pn = original;
-    } else if (isLidUser(original)) {
-      if (jidAlternativo && isPnUser(jidAlternativo)) {
-        pn = jidNormalizedUser(jidAlternativo);
-      } else {
-        const mapeado = await this.sock?.signalRepository.lidMapping.getPNForLID(original).catch(() => null);
-        if (mapeado) pn = jidNormalizedUser(mapeado);
+    const alt = jidAlternativo ? jidNormalizedUser(jidAlternativo) : undefined;
+    let pn = isPnUser(original) ? original : alt && isPnUser(alt) ? alt : undefined;
+    let lid = isLidUser(original) ? original : alt && isLidUser(alt) ? alt : undefined;
+    if (lid && pn) identidades.registrarPar(lid, pn);
+    pn ??= identidades.parDe(lid);
+    if (lid && !pn) {
+      // getPNForLID só consulta o cache e as chaves salvas da sessão (não fala com o servidor).
+      const mapeado = await this.sock?.signalRepository.lidMapping.getPNForLID(lid).catch(() => null);
+      if (mapeado) {
+        pn = jidNormalizedUser(mapeado);
+        identidades.registrarPar(lid, pn);
       }
     }
-    if (pn) return { ...base, jid: pn, jidOriginal: original, telefone: jidDecode(pn)?.user ?? null };
-    return { ...base, jid: original, jidOriginal: original };
+    lid ??= identidades.parDe(pn);
+
+    const chave = identidades.chaveDe([original, pn, lid], pn ?? original);
+    const jidsConhecidos = [...new Set([chave, original, pn, lid].filter((j): j is string => !!j))];
+    return { ...base, jid: chave, jidOriginal: original, jidsConhecidos, telefone: pn ? (jidDecode(pn)?.user ?? null) : null };
   }
 
   // ---- Comandos vindos do app ----
 
   async novoQr(): Promise<void> {
+    if (this.suspensa) throw new ErroComando('Consentimento revogado no app');
     if (this.statusAtual === 'conectado') {
       throw new ErroComando('Já conectado: desconecte antes de pedir um novo QR');
     }
@@ -268,6 +304,7 @@ class ConexaoWhatsApp {
   }
 
   async reconectar(): Promise<void> {
+    if (this.suspensa) throw new ErroComando('Consentimento revogado no app');
     await this.fecharSocket();
     this.tentativas = 0;
     await this.iniciar();
@@ -290,6 +327,21 @@ class ConexaoWhatsApp {
     }
     await apagarSessao();
     await this.definirStatus('desconectado', { qr_code: null });
+  }
+
+  /**
+   * Consentimento revogado: fecha o socket sem logout e sem apagar nada (sessão local e dados no banco
+   * continuam). Nenhuma conexão é aberta até o consentimento voltar.
+   */
+  async suspenderPorConsentimento(): Promise<void> {
+    this.suspensa = true;
+    await this.fecharSocket();
+    await this.definirStatus('aguardando_consentimento', { qr_code: null });
+  }
+
+  /** Consentimento aceito de novo: libera novas conexões (quem chama decide se conecta já). */
+  liberarConsentimento(): void {
+    this.suspensa = false;
   }
 
   /** SIGTERM: fecha o socket sem logout para retomar a mesma sessão após o reinício. */

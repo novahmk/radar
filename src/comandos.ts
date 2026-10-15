@@ -16,11 +16,18 @@ const acoes: Record<TipoComando, () => Promise<void>> = {
   desconectar: () => whatsapp.desconectar(),
 };
 
+type StatusComando = 'executado' | 'erro';
+
 /** Fila de comandos do app, lida por polling na ponte-api a cada 10 s. Um comando por vez. */
 class Comandos {
   private timer?: NodeJS.Timeout;
   private executando = false;
   private parado = false;
+  /**
+   * Comandos já executados cujo status ainda não foi gravado. Eles não são executados de novo:
+   * o status é reenviado a cada ciclo de polling até a ponte-api confirmar.
+   */
+  private statusAGravar = new Map<string, StatusComando>();
 
   iniciar(): void {
     this.timer = setInterval(() => void this.processarPendentes(), INTERVALO_POLLING_MS);
@@ -36,9 +43,11 @@ class Comandos {
     if (this.parado || this.executando) return;
     this.executando = true;
     try {
+      await this.gravarStatusPendentes();
       const { comandos } = await chamar<{ comandos?: Comando[] }>('comandos_pendentes');
       for (const cmd of comandos ?? []) {
         if (this.parado) return;
+        if (this.statusAGravar.has(cmd.id)) continue;
         await this.executar(cmd);
       }
     } catch (erro) {
@@ -48,8 +57,19 @@ class Comandos {
     }
   }
 
+  private async gravarStatusPendentes(): Promise<void> {
+    for (const [id, status] of this.statusAGravar) {
+      try {
+        await chamar('comando_status', { id, status });
+        this.statusAGravar.delete(id);
+      } catch (erro) {
+        logger.warn({ comando: id, aguardando: this.statusAGravar.size, ...resumoErro(erro) }, 'Status do comando ainda não gravado; nova tentativa no próximo ciclo');
+      }
+    }
+  }
+
   private async executar(cmd: Comando): Promise<void> {
-    let status: 'executado' | 'erro' = 'executado';
+    let status: StatusComando = 'executado';
     const acao = acoes[cmd.tipo as TipoComando];
     logger.info({ comando: cmd.id, tipoComando: cmd.tipo }, 'Executando comando');
     try {
@@ -60,11 +80,8 @@ class Comandos {
       const motivo = erro instanceof ErroComando ? erro.message : undefined;
       logger.warn({ comando: cmd.id, tipoComando: cmd.tipo, motivo, ...resumoErro(erro) }, 'Comando falhou');
     }
-    try {
-      await chamar('comando_status', { id: cmd.id, status });
-    } catch (erro) {
-      logger.error({ comando: cmd.id, ...resumoErro(erro) }, 'Falha ao atualizar status do comando');
-    }
+    this.statusAGravar.set(cmd.id, status);
+    await this.gravarStatusPendentes();
   }
 }
 

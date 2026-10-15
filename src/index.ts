@@ -2,6 +2,7 @@ import { config, VARIAVEIS_OBSOLETAS } from './config.js';
 import { logger, resumoErro } from './logger.js';
 import { atualizarConexao, iniciarHeartbeat, lerEstado, pararHeartbeat } from './ponte.js';
 import { filtros } from './filtros.js';
+import { identidades } from './identidades.js';
 import { sincronizador } from './sync.js';
 import { sessaoSalvaExiste, whatsapp } from './whatsapp.js';
 import { comandos } from './comandos.js';
@@ -14,6 +15,7 @@ const INTERVALO_CONSENTIMENTO_MS = 15_000;
 const LIMITE_LOTE_NO_ENCERRAMENTO_MS = 20_000;
 
 let encerrando = false;
+let timerConsentimento: NodeJS.Timeout | undefined;
 
 process.on('uncaughtException', (erro) => {
   logger.fatal(resumoErro(erro), 'Exceção não tratada; saindo para o Railway reiniciar');
@@ -46,12 +48,50 @@ async function aguardarConsentimento(): Promise<string | null> {
   }
 }
 
+/** Após logout/desconexão a sessão foi apagada: só gera QR quando o app pedir (comando novo_qr). */
+async function conectarConformeEstado(statusAnterior: string | null): Promise<void> {
+  if (!(await sessaoSalvaExiste()) && (statusAnterior === 'sessao_encerrada' || statusAnterior === 'desconectado')) {
+    whatsapp.definirStatusLocal(statusAnterior);
+    logger.info({ status: statusAnterior }, 'Sem sessão salva; aguardando comando novo_qr');
+    return;
+  }
+  await whatsapp.iniciar();
+}
+
+/** Relê o consentimento a cada 15 s: se for revogado, desconecta sem apagar nada; se voltar, retoma. */
+function vigiarConsentimento(): void {
+  let verificando = false;
+  timerConsentimento = setInterval(() => {
+    if (verificando || encerrando) return;
+    verificando = true;
+    void (async () => {
+      try {
+        const { consentido, status } = (await lerEstado()).conexao;
+        if (!consentido && !whatsapp.suspensaPorConsentimento) {
+          logger.warn('Consentimento revogado no app; desconectando sem apagar sessão nem dados');
+          await whatsapp.suspenderPorConsentimento();
+        } else if (consentido && whatsapp.suspensaPorConsentimento) {
+          logger.info('Consentimento aceito de novo; retomando a conexão');
+          whatsapp.liberarConsentimento();
+          await conectarConformeEstado(status);
+        }
+      } catch (erro) {
+        // Falha de leitura não é revogação: mantém o estado atual.
+        logger.error(resumoErro(erro), 'Falha ao reverificar consentimento');
+      } finally {
+        verificando = false;
+      }
+    })();
+  }, INTERVALO_CONSENTIMENTO_MS);
+}
+
 async function main(): Promise<void> {
   logger.info('Iniciando radar-ponte (somente leitura)');
   if (VARIAVEIS_OBSOLETAS.length > 0) {
     logger.warn({ variaveis: VARIAVEIS_OBSOLETAS }, 'Variáveis obsoletas no ambiente (não são mais usadas); remova-as');
   }
   iniciarHeartbeat();
+  await identidades.carregar();
   await sincronizador.iniciar();
   await filtros.iniciar();
 
@@ -60,20 +100,9 @@ async function main(): Promise<void> {
   logger.info('Consentimento confirmado');
 
   comandos.iniciar();
-  try {
-    await filaConversas.iniciar();
-  } catch (erro) {
-    // Sem a fila a captura continua; o processamento volta no próximo reinício.
-    logger.error(resumoErro(erro), 'Falha ao iniciar a fila de conversas');
-  }
-
-  // Após logout/desconexão a sessão foi apagada: só gera QR quando o app pedir (comando novo_qr).
-  if (!(await sessaoSalvaExiste()) && (statusAnterior === 'sessao_encerrada' || statusAnterior === 'desconectado')) {
-    whatsapp.definirStatusLocal(statusAnterior);
-    logger.info({ status: statusAnterior }, 'Sem sessão salva; aguardando comando novo_qr');
-    return;
-  }
-  await whatsapp.iniciar();
+  filaConversas.iniciar();
+  vigiarConsentimento();
+  await conectarConformeEstado(statusAnterior);
 }
 
 async function encerrar(sinal: string): Promise<void> {
@@ -83,10 +112,12 @@ async function encerrar(sinal: string): Promise<void> {
   setTimeout(() => process.exit(0), 30_000).unref();
   try {
     pararHeartbeat();
+    if (timerConsentimento) clearInterval(timerConsentimento);
     await comandos.parar();
     filtros.parar();
     await filaConversas.parar(LIMITE_LOTE_NO_ENCERRAMENTO_MS);
     await sincronizador.encerrar(LIMITE_LOTE_NO_ENCERRAMENTO_MS);
+    await identidades.gravarAgora();
     await whatsapp.encerrarParaReinicio();
   } catch (erro) {
     logger.error(resumoErro(erro), 'Erro durante o encerramento');
