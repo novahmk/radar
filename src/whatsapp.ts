@@ -22,7 +22,7 @@ import {
 import QRCode from 'qrcode';
 import { config } from './config.js';
 import { logger, loggerBaileys, resumoErro } from './logger.js';
-import { atualizarConexao, type StatusConexao } from './supabase.js';
+import { atualizarConexao, type StatusConexao } from './ponte.js';
 import { sincronizador, type ChatResolvido } from './sync.js';
 
 const PASTA_AUTH = path.join(config.DATA_DIR, 'auth');

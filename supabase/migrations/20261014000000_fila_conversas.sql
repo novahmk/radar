@@ -15,7 +15,7 @@ create index if not exists fila_conversas_owner_status_idx on public.fila_conver
 
 alter table public.fila_conversas enable row level security;
 
--- O app só lê a própria fila; a ponte grava com a service role (que ignora RLS).
+-- O app só lê a própria fila; a Edge Function ponte-api grava com a service role (que ignora RLS).
 drop policy if exists "fila_conversas_select_proprio" on public.fila_conversas;
 create policy "fila_conversas_select_proprio" on public.fila_conversas
   for select using (auth.uid() = owner_id);

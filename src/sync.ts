@@ -1,11 +1,10 @@
 import { normalizeMessageContent, type WAMessage, type proto } from '@whiskeysockets/baileys';
 import { filtros } from './filtros.js';
 import { logger, resumoErro } from './logger.js';
-import { comRetry, OWNER_ID, supabase } from './supabase.js';
+import { chamar, lerEstado } from './ponte.js';
 
 const TAMANHO_LOTE = 200;
 const OCIOSIDADE_HISTORICO_MS = 60_000;
-const CONCORRENCIA_RECALCULO = 5;
 
 /** Identidade canônica de uma conversa, resolvida pela camada do WhatsApp. */
 export interface ChatResolvido {
@@ -35,8 +34,6 @@ interface Registro {
   nome?: string;
 }
 
-type Autor = Registro['autor'];
-
 /** Extrai texto e indicador de mídia. Retorna null para tipos que não gravamos (sistema, protocolo, reação etc.). */
 function extrairConteudo(m: WAMessage): { texto: string; temMidia: boolean } | null {
   if (m.messageStubType) return null;
@@ -61,14 +58,6 @@ function timestampParaIso(ts: WAMessage['messageTimestamp']): string | null {
   return new Date(segundos * 1000).toISOString();
 }
 
-async function emParalelo<T>(itens: T[], limite: number, fn: (item: T) => Promise<void>): Promise<void> {
-  let i = 0;
-  const trabalhadores = Array.from({ length: Math.min(limite, itens.length) }, async () => {
-    while (i < itens.length) await fn(itens[i++]!);
-  });
-  await Promise.all(trabalhadores);
-}
-
 class Sincronizador {
   private fila: ItemFila[] = [];
   private processando = false;
@@ -80,23 +69,14 @@ class Sincronizador {
   private mensagensRecebidas = 0;
   private timerHistorico?: NodeJS.Timeout;
   private historicoEmAndamento = false;
-  private aoGravarConversas?: (conversaIds: string[]) => Promise<void>;
 
   /** Carrega o contador acumulado para continuar somando após reinícios. */
   async iniciar(): Promise<void> {
-    const { data } = await comRetry('ler_sincronizacao', () =>
-      supabase.from('sincronizacao').select('mensagens_recebidas').eq('owner_id', OWNER_ID).maybeSingle(),
-    );
-    this.mensagensRecebidas = Number((data as { mensagens_recebidas?: number } | null)?.mensagens_recebidas ?? 0);
+    this.mensagensRecebidas = (await lerEstado()).mensagensRecebidas;
   }
 
   definirResolvedor(fn: ResolvedorChat): void {
     this.resolvedor = fn;
-  }
-
-  /** Chamado com as conversas individuais gravadas em cada lote (usado pela fila). */
-  definirAoGravarConversas(fn: (conversaIds: string[]) => Promise<void>): void {
-    this.aoGravarConversas = fn;
   }
 
   /** true quando não há mensagens na memória nem histórico chegando. */
@@ -157,9 +137,7 @@ class Sincronizador {
     if (this.historicoEmAndamento) return;
     this.historicoEmAndamento = true;
     try {
-      await comRetry('sincronizacao_inicio', () =>
-        supabase.from('sincronizacao').upsert({ owner_id: OWNER_ID, concluida: false }, { onConflict: 'owner_id' }),
-      );
+      await chamar('historico', { concluida: false });
     } catch (erro) {
       logger.error(resumoErro(erro), 'Falha ao marcar início do histórico');
     }
@@ -177,9 +155,7 @@ class Sincronizador {
       return;
     }
     try {
-      await comRetry('sincronizacao_concluida', () =>
-        supabase.from('sincronizacao').upsert({ owner_id: OWNER_ID, concluida: true }, { onConflict: 'owner_id' }),
-      );
+      await chamar('historico', { concluida: true });
       this.historicoEmAndamento = false;
       logger.info('Sincronização do histórico concluída (60 s sem novos lotes)');
     } catch (erro) {
@@ -233,142 +209,38 @@ class Sincronizador {
       }
     }
     const registros = [...porId.values()];
+    const recebidas = this.mensagensRecebidas + lote.length;
 
-    if (registros.length > 0) {
-      const idsConversas = await this.gravarConversas(registros);
-      const linhas = registros.flatMap((r) => {
-        const conversaId = idsConversas.get(r.chat.jid);
-        if (!conversaId) return [];
-        return [
-          {
-            owner_id: OWNER_ID,
-            conversa_id: conversaId,
-            id_externo: r.id_externo,
-            autor: r.autor,
-            enviada_em: r.enviada_em,
-            texto: r.texto,
-            tem_midia: r.tem_midia,
-          },
-        ];
-      });
-      await comRetry('gravar_mensagens', () =>
-        supabase.from('mensagens').upsert(linhas, { onConflict: 'owner_id,id_externo' }),
-      );
-      await this.recalcularConversas([...new Set(linhas.map((l) => l.conversa_id))]);
-
-      const individuais = new Set<string>();
-      for (const r of registros) {
-        const id = idsConversas.get(r.chat.jid);
-        if (id && !r.chat.ehGrupo) individuais.add(id);
-      }
-      if (this.aoGravarConversas && individuais.size > 0) {
-        try {
-          await this.aoGravarConversas([...individuais]);
-        } catch (erro) {
-          // A conversa entra na fila no próximo reinício (backfill).
-          logger.error(resumoErro(erro), 'Falha ao enfileirar conversas');
-        }
-      }
-    }
-
-    this.mensagensRecebidas += lote.length;
-    await this.atualizarContadores();
+    // Uma única ação idempotente: upsert de conversas e mensagens, recálculo, fila e contadores ficam no servidor.
+    await chamar('lote', {
+      conversas: this.conversasDoLote(registros),
+      mensagens: registros.map((r) => ({
+        jid: r.chat.jid,
+        id_externo: r.id_externo,
+        autor: r.autor,
+        enviada_em: r.enviada_em,
+        texto: r.texto,
+        tem_midia: r.tem_midia,
+      })),
+      mensagens_recebidas: recebidas,
+    });
+    this.mensagensRecebidas = recebidas;
     logger.info(
       { recebidas: lote.length, gravadas: registros.length, historico: lote.some((i) => i.historico), naFila: this.fila.length },
       'Lote processado',
     );
   }
 
-  /** Upsert por (owner_id, jid). Campos opcionais só entram quando têm valor, para não apagar dados já gravados. */
-  private async gravarConversas(registros: Registro[]): Promise<Map<string, string>> {
+  /** Uma linha por jid. Campos opcionais só vão quando têm valor, para não apagar dados já gravados. */
+  private conversasDoLote(registros: Registro[]): Record<string, unknown>[] {
     const porJid = new Map<string, Record<string, unknown>>();
     for (const r of registros) {
-      const atual = porJid.get(r.chat.jid) ?? {
-        owner_id: OWNER_ID,
-        jid: r.chat.jid,
-        eh_grupo: r.chat.ehGrupo,
-        origem: 'whatsapp',
-      };
+      const atual = porJid.get(r.chat.jid) ?? { jid: r.chat.jid, eh_grupo: r.chat.ehGrupo };
       if (r.chat.telefone) atual.telefone = r.chat.telefone;
       if (r.nome) atual.nome_contato = r.nome;
       porJid.set(r.chat.jid, atual);
     }
-
-    // O upsert em massa exige o mesmo conjunto de colunas em todas as linhas.
-    const grupos = new Map<string, Record<string, unknown>[]>();
-    for (const linha of porJid.values()) {
-      const chave = Object.keys(linha).sort().join(',');
-      grupos.set(chave, [...(grupos.get(chave) ?? []), linha]);
-    }
-
-    const ids = new Map<string, string>();
-    for (const linhas of grupos.values()) {
-      const { data } = await comRetry('gravar_conversas', () =>
-        supabase.from('conversas').upsert(linhas, { onConflict: 'owner_id,jid' }).select('id, jid'),
-      );
-      for (const c of (data as { id: string; jid: string }[] | null) ?? []) ids.set(c.jid, c.id);
-    }
-    return ids;
-  }
-
-  /** Recalcula total e última mensagem a partir do banco, o que mantém os números consistentes mesmo com regravações. */
-  async recalcularConversas(conversaIds: string[]): Promise<void> {
-    await emParalelo(conversaIds, CONCORRENCIA_RECALCULO, async (id) => {
-      const [ultima, total] = await Promise.all([
-        comRetry('ultima_mensagem', () =>
-          supabase
-            .from('mensagens')
-            .select('enviada_em, autor')
-            .eq('owner_id', OWNER_ID)
-            .eq('conversa_id', id)
-            .order('enviada_em', { ascending: false })
-            .limit(1)
-            .maybeSingle(),
-        ),
-        comRetry('total_mensagens', () =>
-          supabase
-            .from('mensagens')
-            .select('id', { count: 'exact', head: true })
-            .eq('owner_id', OWNER_ID)
-            .eq('conversa_id', id),
-        ),
-      ]);
-      const u = ultima.data as { enviada_em: string; autor: Autor } | null;
-      await comRetry('atualizar_conversa', () =>
-        supabase
-          .from('conversas')
-          .update({
-            ultima_mensagem_em: u?.enviada_em ?? null,
-            ultima_mensagem_autor: u?.autor ?? null,
-            total_mensagens: total.count ?? 0,
-          })
-          .eq('owner_id', OWNER_ID)
-          .eq('id', id),
-      );
-    });
-  }
-
-  private async atualizarContadores(): Promise<void> {
-    const [msgs, convs] = await Promise.all([
-      comRetry('contar_mensagens', () =>
-        supabase.from('mensagens').select('id', { count: 'exact', head: true }).eq('owner_id', OWNER_ID),
-      ),
-      comRetry('contar_conversas', () =>
-        supabase.from('conversas').select('id', { count: 'exact', head: true }).eq('owner_id', OWNER_ID),
-      ),
-    ]);
-    await comRetry('atualizar_sincronizacao', () =>
-      supabase.from('sincronizacao').upsert(
-        {
-          owner_id: OWNER_ID,
-          mensagens_recebidas: this.mensagensRecebidas,
-          mensagens_gravadas: msgs.count ?? 0,
-          conversas_gravadas: convs.count ?? 0,
-          ultimo_lote_em: new Date().toISOString(),
-        },
-        { onConflict: 'owner_id' },
-      ),
-    );
+    return [...porJid.values()];
   }
 }
 

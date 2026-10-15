@@ -1,5 +1,5 @@
 import { logger, resumoErro } from './logger.js';
-import { comRetry, OWNER_ID, supabase } from './supabase.js';
+import { chamar, lerEstado } from './ponte.js';
 import { sincronizador } from './sync.js';
 
 const TAMANHO_LOTE_PADRAO = 5;
@@ -7,7 +7,6 @@ const TAMANHO_LOTE_MAXIMO = 50;
 const INTERVALO_PADRAO_MIN = 10;
 const MAX_TENTATIVAS = 3;
 const ESPERA_OCIOSA_MS = 15_000;
-const PAGINA_BACKFILL = 500;
 
 interface ConfigExtracao {
   tamanhoLote: number;
@@ -17,7 +16,6 @@ interface ConfigExtracao {
 
 interface ItemLote {
   filaId: string;
-  conversaId: string;
   tentativas: number;
 }
 
@@ -38,27 +36,14 @@ class FilaConversas {
   private loteNumero = 0;
   private ultimoEstado?: 'pausada' | 'ociosa' | 'aguardando_captura';
 
+  /**
+   * No servidor: conversas que ficaram 'em_processamento' quando o serviço caiu voltam para 'pendente'
+   * e conversas capturadas antes da fila existir (ou de uma falha) são enfileiradas.
+   */
   async iniciar(): Promise<void> {
-    // Conversas que ficaram no meio de um lote quando o serviço caiu voltam para a fila.
-    await comRetry('fila_retomar', () =>
-      supabase
-        .from('fila_conversas')
-        .update({ status: 'pendente' })
-        .eq('owner_id', OWNER_ID)
-        .eq('status', 'em_processamento'),
-    );
-    const { data } = await comRetry('fila_ultimo_lote', () =>
-      supabase
-        .from('fila_conversas')
-        .select('lote_numero')
-        .eq('owner_id', OWNER_ID)
-        .not('lote_numero', 'is', null)
-        .order('lote_numero', { ascending: false })
-        .limit(1)
-        .maybeSingle(),
-    );
-    this.loteNumero = Number((data as { lote_numero?: number } | null)?.lote_numero ?? 0);
-    await this.enfileirarExistentes();
+    const { ultimo_lote, enfileiradas } = await chamar<{ ultimo_lote?: unknown; enfileiradas?: unknown }>('fila_iniciar');
+    this.loteNumero = inteiroOu(ultimo_lote, 0, 0, Number.MAX_SAFE_INTEGER);
+    logger.info({ enfileiradas: inteiroOu(enfileiradas, 0, 0, Number.MAX_SAFE_INTEGER) }, 'Fila de conversas sincronizada com as conversas existentes');
     this.loop = this.executar();
   }
 
@@ -69,64 +54,9 @@ class FilaConversas {
     if (this.loop) await Promise.race([this.loop, new Promise((r) => setTimeout(r, limiteMs))]);
   }
 
-  /** Coloca como 'pendente' as conversas individuais e não ignoradas que ainda não estão na fila. */
-  async enfileirar(conversaIds: string[]): Promise<void> {
-    if (conversaIds.length === 0) return;
-    const { data } = await comRetry('fila_elegiveis', () =>
-      supabase
-        .from('conversas')
-        .select('id')
-        .eq('owner_id', OWNER_ID)
-        .in('id', conversaIds)
-        .eq('eh_grupo', false)
-        .not('ignorada', 'is', true),
-    );
-    await this.inserir(((data as { id: string }[] | null) ?? []).map((c) => c.id));
-  }
-
-  private async inserir(conversaIds: string[]): Promise<void> {
-    if (conversaIds.length === 0) return;
-    const agora = new Date().toISOString();
-    const linhas = conversaIds.map((id) => ({
-      owner_id: OWNER_ID,
-      conversa_id: id,
-      status: 'pendente',
-      tentativas: 0,
-      enfileirada_em: agora,
-    }));
-    await comRetry('fila_inserir', () =>
-      supabase.from('fila_conversas').upsert(linhas, { onConflict: 'conversa_id', ignoreDuplicates: true }),
-    );
-  }
-
-  /** Garante que conversas capturadas antes da fila existir (ou de uma falha) também entrem nela. */
-  private async enfileirarExistentes(): Promise<void> {
-    let total = 0;
-    for (let inicio = 0; ; inicio += PAGINA_BACKFILL) {
-      const { data } = await comRetry('fila_backfill', () =>
-        supabase
-          .from('conversas')
-          .select('id')
-          .eq('owner_id', OWNER_ID)
-          .eq('eh_grupo', false)
-          .not('ignorada', 'is', true)
-          .order('id')
-          .range(inicio, inicio + PAGINA_BACKFILL - 1),
-      );
-      const ids = ((data as { id: string }[] | null) ?? []).map((c) => c.id);
-      await this.inserir(ids);
-      total += ids.length;
-      if (ids.length < PAGINA_BACKFILL) break;
-    }
-    logger.info({ conversasVerificadas: total }, 'Fila de conversas sincronizada com as conversas existentes');
-  }
-
   private async lerConfig(): Promise<ConfigExtracao> {
-    // select('*') tolera colunas que o app ainda não criou.
-    const { data } = await comRetry('ler_config_extracao', () =>
-      supabase.from('configuracoes').select('*').eq('owner_id', OWNER_ID).maybeSingle(),
-    );
-    const c = (data as Record<string, unknown> | null) ?? {};
+    // Colunas que o app ainda não criou chegam ausentes e caem no padrão.
+    const c = (await lerEstado()).configuracoes;
     return {
       tamanhoLote: inteiroOu(c.tamanho_lote, TAMANHO_LOTE_PADRAO, 1, TAMANHO_LOTE_MAXIMO),
       intervaloMs: inteiroOu(c.intervalo_entre_lotes_min, INTERVALO_PADRAO_MIN, 0, 24 * 60) * 60_000,
@@ -165,7 +95,7 @@ class FilaConversas {
           await this.esperar(ESPERA_OCIOSA_MS);
           continue;
         }
-        const itens = await this.proximosPendentes(cfg.tamanhoLote);
+        const itens = await this.reservarProximos(cfg.tamanhoLote);
         if (itens.length === 0) {
           this.registrarEstado('ociosa');
           await this.atualizarProgresso(null);
@@ -185,35 +115,19 @@ class FilaConversas {
     }
   }
 
-  /** Pendentes da conversa mais recente para a mais antiga. */
-  private async proximosPendentes(limite: number): Promise<ItemLote[]> {
-    const { data } = await comRetry('fila_pendentes', () =>
-      supabase
-        .from('conversas')
-        .select('id, fila_conversas!inner(id, tentativas)')
-        .eq('owner_id', OWNER_ID)
-        .eq('eh_grupo', false)
-        .not('ignorada', 'is', true)
-        .eq('fila_conversas.status', 'pendente')
-        .order('ultima_mensagem_em', { ascending: false, nullsFirst: false })
-        .limit(limite),
+  /** Pendentes da conversa mais recente para a mais antiga; o servidor já as marca como 'em_processamento'. */
+  private async reservarProximos(limite: number): Promise<ItemLote[]> {
+    type Linha = { fila_id?: unknown; tentativas?: unknown };
+    const { itens } = await chamar<{ itens?: Linha[] }>('fila_proximos', { limite });
+    return (itens ?? []).flatMap((l) =>
+      typeof l.fila_id === 'string'
+        ? [{ filaId: l.fila_id, tentativas: inteiroOu(l.tentativas, 0, 0, MAX_TENTATIVAS) }]
+        : [],
     );
-    type Linha = { id: string; fila_conversas: { id: string; tentativas: number | null } | { id: string; tentativas: number | null }[] };
-    return ((data as Linha[] | null) ?? []).flatMap((l) => {
-      const f = Array.isArray(l.fila_conversas) ? l.fila_conversas[0] : l.fila_conversas;
-      return f ? [{ filaId: f.id, conversaId: l.id, tentativas: f.tentativas ?? 0 }] : [];
-    });
   }
 
   private async processarLote(itens: ItemLote[]): Promise<void> {
     const lote = this.loteNumero + 1;
-    await comRetry('fila_em_processamento', () =>
-      supabase
-        .from('fila_conversas')
-        .update({ status: 'em_processamento' })
-        .eq('owner_id', OWNER_ID)
-        .in('id', itens.map((i) => i.filaId)),
-    );
     this.loteNumero = lote;
     await this.atualizarProgresso(null);
 
@@ -221,14 +135,8 @@ class FilaConversas {
     let falhas = 0;
     for (const item of itens) {
       try {
-        await sincronizador.recalcularConversas([item.conversaId]);
-        await comRetry('fila_processada', () =>
-          supabase
-            .from('fila_conversas')
-            .update({ status: 'processada', processada_em: new Date().toISOString(), lote_numero: lote })
-            .eq('owner_id', OWNER_ID)
-            .eq('id', item.filaId),
-        );
+        // Recalcula total_mensagens e última mensagem da conversa e marca 'processada' com o número do lote.
+        await chamar('fila_processada', { fila_id: item.filaId, lote_numero: lote });
         processadas++;
       } catch (erro) {
         falhas++;
@@ -243,9 +151,7 @@ class FilaConversas {
     const status = tentativas >= MAX_TENTATIVAS ? 'erro' : 'pendente';
     logger.warn({ tentativas, status, ...resumoErro(erro) }, 'Falha ao processar conversa da fila');
     try {
-      await comRetry('fila_falha', () =>
-        supabase.from('fila_conversas').update({ status, tentativas }).eq('owner_id', OWNER_ID).eq('id', item.filaId),
-      );
+      await chamar('fila_falha', { fila_id: item.filaId, tentativas, status });
     } catch (e) {
       // Se nem isso gravar, a conversa volta a 'pendente' no próximo reinício.
       logger.error(resumoErro(e), 'Falha ao registrar erro da conversa na fila');
@@ -254,30 +160,8 @@ class FilaConversas {
 
   private async atualizarProgresso(proximoLoteEm: string | null): Promise<void> {
     try {
-      const [total, processadas] = await Promise.all([
-        comRetry('fila_total', () =>
-          supabase.from('fila_conversas').select('id', { count: 'exact', head: true }).eq('owner_id', OWNER_ID),
-        ),
-        comRetry('fila_processadas', () =>
-          supabase
-            .from('fila_conversas')
-            .select('id', { count: 'exact', head: true })
-            .eq('owner_id', OWNER_ID)
-            .eq('status', 'processada'),
-        ),
-      ]);
-      await comRetry('fila_progresso', () =>
-        supabase.from('sincronizacao').upsert(
-          {
-            owner_id: OWNER_ID,
-            conversas_total_fila: total.count ?? 0,
-            conversas_processadas: processadas.count ?? 0,
-            lote_atual: this.loteNumero,
-            proximo_lote_em: proximoLoteEm,
-          },
-          { onConflict: 'owner_id' },
-        ),
-      );
+      // O servidor conta conversas_total_fila e conversas_processadas.
+      await chamar('fila_progresso', { lote_atual: this.loteNumero, proximo_lote_em: proximoLoteEm });
     } catch (erro) {
       logger.error(resumoErro(erro), 'Falha ao atualizar progresso da fila');
     }

@@ -1,5 +1,5 @@
-import { comRetry, OWNER_ID, supabase } from './supabase.js';
 import { logger, resumoErro } from './logger.js';
+import { lerEstado } from './ponte.js';
 
 const INTERVALO_RECARGA_MS = 60_000;
 
@@ -30,17 +30,11 @@ class Filtros {
 
   async recarregar(): Promise<void> {
     try {
-      const [cfg, ignorados] = await Promise.all([
-        comRetry('ler_configuracoes', () =>
-          supabase.from('configuracoes').select('ignorar_grupos').eq('owner_id', OWNER_ID).maybeSingle(),
-        ),
-        comRetry('ler_contatos_ignorados', () =>
-          supabase.from('contatos_ignorados').select('telefone').eq('owner_id', OWNER_ID),
-        ),
-      ]);
-      this.ignorarGrupos = Boolean((cfg.data as { ignorar_grupos?: boolean } | null)?.ignorar_grupos);
-      const lista = (ignorados.data as { telefone: string | null }[] | null) ?? [];
-      this.telefonesIgnorados = new Set(lista.map((l) => normalizarTelefone(l.telefone)).filter((t): t is string => !!t));
+      const estado = await lerEstado();
+      this.ignorarGrupos = estado.configuracoes.ignorar_grupos === true;
+      this.telefonesIgnorados = new Set(
+        estado.contatosIgnorados.map((t) => normalizarTelefone(t)).filter((t): t is string => !!t),
+      );
       logger.debug({ ignorarGrupos: this.ignorarGrupos, contatosIgnorados: this.telefonesIgnorados.size }, 'Filtros recarregados');
     } catch (erro) {
       // Mantém os filtros anteriores se a recarga falhar.

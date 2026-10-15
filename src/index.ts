@@ -1,6 +1,6 @@
-import { config } from './config.js';
+import { config, VARIAVEIS_OBSOLETAS } from './config.js';
 import { logger, resumoErro } from './logger.js';
-import { atualizarConexao, lerConexao } from './supabase.js';
+import { atualizarConexao, iniciarHeartbeat, lerEstado, pararHeartbeat } from './ponte.js';
 import { filtros } from './filtros.js';
 import { sincronizador } from './sync.js';
 import { sessaoSalvaExiste, whatsapp } from './whatsapp.js';
@@ -31,7 +31,7 @@ async function aguardarConsentimento(): Promise<string | null> {
   for (;;) {
     if (encerrando) return null;
     try {
-      const { consentido, status } = await lerConexao();
+      const { consentido, status } = (await lerEstado()).conexao;
       if (consentido) return status;
       if (!avisado) {
         whatsapp.definirStatusLocal('aguardando_consentimento');
@@ -48,6 +48,10 @@ async function aguardarConsentimento(): Promise<string | null> {
 
 async function main(): Promise<void> {
   logger.info('Iniciando radar-ponte (somente leitura)');
+  if (VARIAVEIS_OBSOLETAS.length > 0) {
+    logger.warn({ variaveis: VARIAVEIS_OBSOLETAS }, 'Variáveis obsoletas no ambiente (não são mais usadas); remova-as');
+  }
+  iniciarHeartbeat();
   await sincronizador.iniciar();
   await filtros.iniciar();
 
@@ -56,7 +60,6 @@ async function main(): Promise<void> {
   logger.info('Consentimento confirmado');
 
   comandos.iniciar();
-  sincronizador.definirAoGravarConversas((ids) => filaConversas.enfileirar(ids));
   try {
     await filaConversas.iniciar();
   } catch (erro) {
@@ -79,6 +82,7 @@ async function encerrar(sinal: string): Promise<void> {
   logger.info({ sinal }, 'Encerrando com limpeza');
   setTimeout(() => process.exit(0), 30_000).unref();
   try {
+    pararHeartbeat();
     await comandos.parar();
     filtros.parar();
     await filaConversas.parar(LIMITE_LOTE_NO_ENCERRAMENTO_MS);
